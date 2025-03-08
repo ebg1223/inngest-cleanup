@@ -227,16 +227,20 @@ class EventCleaner:
                             query = """
                             WITH deleted_events AS (
                                 DELETE FROM events e
-                                WHERE e.received_at < %s
-                                AND NOT EXISTS (
-                                    SELECT 1 FROM function_runs fr 
-                                    WHERE fr.event_id = e.internal_id
+                                WHERE e.internal_id IN (
+                                    SELECT e.internal_id
+                                    FROM events e
+                                    WHERE e.received_at < %s
+                                    AND NOT EXISTS (
+                                        SELECT 1 FROM function_runs fr 
+                                        WHERE fr.event_id = e.internal_id
+                                    )
+                                    AND NOT EXISTS (
+                                        SELECT 1 FROM event_batches eb 
+                                        WHERE position(encode(e.internal_id, 'hex') in encode(eb.event_ids, 'hex')) > 0
+                                    )
+                                    LIMIT %s
                                 )
-                                AND NOT EXISTS (
-                                    SELECT 1 FROM event_batches eb 
-                                    WHERE position(encode(e.internal_id, 'hex') in encode(eb.event_ids, 'hex')) > 0
-                                )
-                                LIMIT %s
                                 RETURNING 1
                             )
                             SELECT COUNT(*) FROM deleted_events;
