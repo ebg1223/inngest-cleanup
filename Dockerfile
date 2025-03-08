@@ -15,6 +15,9 @@ WORKDIR /build
 COPY pyproject.toml .
 COPY uv.lock .
 
+# The key change: Replace psycopg2-binary with psycopg2 in your pyproject.toml
+# You don't need to do this here if you've already updated the file locally
+
 # Install dependencies to a local directory
 RUN uv pip install --no-cache --system --target=/install .
 
@@ -36,3 +39,4 @@ COPY cleanup_events.py .
 
 # Default command
 ENTRYPOINT ["/app/run.sh"]
+
