@@ -156,7 +156,8 @@ class EventCleaner:
         try:
             self.conn = psycopg2.connect(
                 self.db_url,
-                cursor_factory=psycopg2.extras.DictCursor
+                cursor_factory=psycopg2.extras.DictCursor,
+                options="-c statement_timeout=60000"  # 60 second timeout for all statements
             )
             # Enable autocommit for better performance with SKIP LOCKED
             self.conn.set_session(autocommit=True)
@@ -205,46 +206,86 @@ class EventCleaner:
 
     def get_stats(self):
         """Get statistics about the cleanup operation"""
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total_events,
-                    COUNT(*) FILTER (WHERE received_at < %s) as eligible_events,
-                    MIN(received_at) as oldest_event,
-                    MAX(received_at) as newest_event
-                FROM events
-            """, (datetime.now(UTC) - timedelta(days=self.retention_days),))
-            stats = cur.fetchone()
-            return {
-                'total_events': stats[0],
-                'eligible_events': stats[1],
-                'oldest_event': stats[2],
-                'newest_event': stats[3]
-            }
+        cutoff_date = datetime.now(UTC) - timedelta(days=self.retention_days)
+        
+        # Add logging to track progress
+        self.logger.info("Fetching database statistics...")
+        
+        with self.db_retry():
+            with self.conn.cursor() as cur:
+                # Use a more optimized query that avoids full table scans if possible
+                cur.execute("""
+                    SELECT 
+                        (SELECT reltuples::bigint FROM pg_class WHERE relname = 'events') as estimated_total,
+                        COUNT(*) FILTER (WHERE received_at < %s) as eligible_events,
+                        MIN(received_at) as oldest_event,
+                        MAX(received_at) as newest_event
+                    FROM events
+                    WHERE received_at IS NOT NULL
+                    LIMIT 1
+                """, (cutoff_date,))
+                stats = cur.fetchone()
+                
+                # If the estimated count is zero or null, fall back to actual count
+                if not stats[0]:
+                    self.logger.info("Getting accurate event count (this may take longer)...")
+                    cur.execute("SELECT COUNT(*) FROM events")
+                    total_count = cur.fetchone()[0]
+                else:
+                    total_count = stats[0]
+                
+                return {
+                    'total_events': total_count,
+                    'eligible_events': stats[1] or 0,  # Handle NULL case
+                    'oldest_event': stats[2],
+                    'newest_event': stats[3]
+                }
 
     def cleanup(self):
         """Clean up all old events that are no longer needed"""
         self.logger.info(f"Starting cleanup with retention period of {self.retention_days} days")
         
-        # Print initial statistics
-        stats = self.get_stats()
-        self.logger.info(
-            f"Initial state: {stats['total_events']:,} total events, "
-            f"{stats['eligible_events']:,} eligible for cleanup"
-        )
-        
-        cutoff_date = datetime.now(UTC) - timedelta(days=self.retention_days)
-        total_deleted = 0
-        start_time = time.time()
-        
         try:
+            # Print initial statistics
+            self.logger.info("Getting initial database statistics (this may take a moment)...")
+            stats = self.get_stats()
+            self.logger.info(
+                f"Initial state: {stats['total_events']:,} total events, "
+                f"{stats['eligible_events']:,} eligible for cleanup"
+            )
+            
+            cutoff_date = datetime.now(UTC) - timedelta(days=self.retention_days)
+            total_deleted = 0
+            start_time = time.time()
+            
+            self.logger.info("Beginning cleanup operations...")
+            
             while not self.check_should_exit():
+                self.logger.info(f"Processing batch of up to {self.batch_size} records...")
                 with self.db_retry():
                     with self.conn.cursor() as cur:
                         if self.dry_run:
+                            self.logger.info("Executing dry run query...")
                             query = """
-                            WITH candidate_events AS (
-                                SELECT 1
+                            SELECT COUNT(*) 
+                            FROM events e
+                            WHERE e.received_at < %s
+                            AND NOT EXISTS (
+                                SELECT 1 FROM function_runs fr 
+                                WHERE fr.event_id = e.internal_id
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM event_batches eb 
+                                WHERE position(encode(e.internal_id, 'hex') in encode(eb.event_ids, 'hex')) > 0
+                            )
+                            LIMIT %s;
+                            """
+                        else:
+                            self.logger.info("Executing delete query...")
+                            # First identify candidates - this allows more efficient querying
+                            query = """
+                            WITH candidates AS (
+                                SELECT e.internal_id
                                 FROM events e
                                 WHERE e.received_at < %s
                                 AND NOT EXISTS (
@@ -256,27 +297,10 @@ class EventCleaner:
                                     WHERE position(encode(e.internal_id, 'hex') in encode(eb.event_ids, 'hex')) > 0
                                 )
                                 LIMIT %s
-                            )
-                            SELECT COUNT(*) FROM candidate_events;
-                            """
-                        else:
-                            query = """
-                            WITH deleted_events AS (
+                            ),
+                            deleted_events AS (
                                 DELETE FROM events e
-                                WHERE e.internal_id IN (
-                                    SELECT e.internal_id
-                                    FROM events e
-                                    WHERE e.received_at < %s
-                                    AND NOT EXISTS (
-                                        SELECT 1 FROM function_runs fr 
-                                        WHERE fr.event_id = e.internal_id
-                                    )
-                                    AND NOT EXISTS (
-                                        SELECT 1 FROM event_batches eb 
-                                        WHERE position(encode(e.internal_id, 'hex') in encode(eb.event_ids, 'hex')) > 0
-                                    )
-                                    LIMIT %s
-                                )
+                                WHERE e.internal_id IN (SELECT internal_id FROM candidates)
                                 RETURNING 1
                             )
                             SELECT COUNT(*) FROM deleted_events;
