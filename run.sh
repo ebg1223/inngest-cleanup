@@ -31,4 +31,8 @@ if [ ! -z "$RETRY_DELAY" ]; then
   ARGS="$ARGS --retry-delay $RETRY_DELAY"
 fi
 
+if [ ! -z "$RUN_INTERVAL" ]; then
+  ARGS="$ARGS --run-interval $RUN_INTERVAL"
+fi
+
 exec python cleanup_events.py $ARGS

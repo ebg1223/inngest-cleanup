@@ -233,23 +233,71 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Print what would be done without making changes')
     parser.add_argument('--max-retries', type=int, default=3, help='Maximum number of retries for database operations')
     parser.add_argument('--retry-delay', type=int, default=5, help='Delay in seconds between retries')
+    parser.add_argument('--run-interval', type=int, default=0, help='Run every N minutes (0 = run once and exit)')
 
     args = parser.parse_args()
 
-    cleaner = EventCleaner(
-        db_url=args.db_url,
-        retention_days=args.retention_days,
-        batch_size=args.batch_size,
-        sleep_seconds=args.sleep_seconds,
-        dry_run=args.dry_run,
-        max_retries=args.max_retries,
-        retry_delay=args.retry_delay
+    # Set up logging at the top level for interval messages
+    logger = logging.getLogger('event_cleaner')
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     )
+    logger.addHandler(handler)
+
+    # Set up signal handler at the top level for graceful shutdown
+    should_exit = False
+    
+    def signal_handler(signum, frame):
+        nonlocal should_exit
+        logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
+        should_exit = True
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        cleaner.cleanup()
-    finally:
-        cleaner.close()
+        while not should_exit:
+            start_time = time.time()
+            
+            cleaner = EventCleaner(
+                db_url=args.db_url,
+                retention_days=args.retention_days,
+                batch_size=args.batch_size,
+                sleep_seconds=args.sleep_seconds,
+                dry_run=args.dry_run,
+                max_retries=args.max_retries,
+                retry_delay=args.retry_delay
+            )
+
+            try:
+                cleaner.cleanup()
+            finally:
+                cleaner.close()
+                
+            # If run-interval is 0 or we need to exit, break out of the loop
+            if args.run_interval == 0 or should_exit:
+                break
+                
+            # Calculate the time to sleep until the next run
+            elapsed_time = time.time() - start_time
+            sleep_time = max(0, args.run_interval * 60 - elapsed_time)
+            
+            if sleep_time > 0 and not should_exit:
+                logger.info(f"Cleanup completed. Next run in {sleep_time:.1f} seconds")
+                
+                # Sleep in small increments to check for exit signal
+                while sleep_time > 0 and not should_exit:
+                    increment = min(1.0, sleep_time)
+                    time.sleep(increment)
+                    sleep_time -= increment
+    
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}")
+        sys.exit(1)
+    
+    logger.info("Exiting cleanup process")
 
 if __name__ == '__main__':
     main()
