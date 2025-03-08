@@ -7,11 +7,59 @@ import psycopg2.extras
 import signal
 import sys
 import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from contextlib import contextmanager
 from datetime import datetime, timedelta, UTC
 
 class GracefulExit(Exception):
     pass
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        self.health_status = kwargs.pop('health_status', lambda: True)
+        super().__init__(*args, **kwargs)
+    
+    def do_GET(self):
+        if self.path == '/health' or self.path == '/':
+            # Return 200 OK if the service is healthy
+            if self.health_status():
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'OK')
+            else:
+                self.send_response(503)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Service Unavailable')
+        else:
+            self.send_response(404)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+    
+    # Silence log messages for healthcheck requests
+    def log_message(self, format, *args):
+        return
+
+def health_server_factory(health_status):
+    def handler(*args, **kwargs):
+        return HealthCheckHandler(*args, health_status=health_status, **kwargs)
+    return handler
+
+def start_health_server(port, health_status_func, logger):
+    """Start a health check server in a separate thread"""
+    handler = health_server_factory(health_status_func)
+    server = HTTPServer(('0.0.0.0', port), handler)
+    
+    logger.info(f"Starting health check server on port {port}")
+    
+    # Run the server in a daemon thread
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    
+    return server
 
 class EventCleaner:
     def __init__(
@@ -240,6 +288,7 @@ def main():
     parser.add_argument('--max-retries', type=int, default=3, help='Maximum number of retries for database operations')
     parser.add_argument('--retry-delay', type=int, default=5, help='Delay in seconds between retries')
     parser.add_argument('--run-interval', type=int, default=0, help='Run every N minutes (0 = run once and exit)')
+    parser.add_argument('--healthcheck-port', type=int, default=0, help='Port for healthcheck server (0 = disabled)')
 
     args = parser.parse_args()
 
@@ -269,6 +318,15 @@ def main():
     # Create a callback function to check exit status
     def should_exit_check():
         return should_exit
+
+    # Health status function for healthcheck server
+    health_server = None
+    if args.healthcheck_port > 0:
+        health_server = start_health_server(
+            args.healthcheck_port,
+            lambda: not should_exit,  # Service is healthy as long as we're not exiting
+            logger
+        )
 
     try:
         while not should_exit:
@@ -310,9 +368,16 @@ def main():
     
     except Exception as e:
         logger.error(f"Unhandled exception: {e}")
+        if health_server:
+            health_server.shutdown()
         sys.exit(1)
     
     logger.info("Exiting cleanup process")
+    
+    # Shut down health check server if it's running
+    if health_server:
+        logger.info("Shutting down health check server")
+        health_server.shutdown()
 
 if __name__ == '__main__':
     main()

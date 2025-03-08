@@ -35,4 +35,8 @@ if [ ! -z "$RUN_INTERVAL" ]; then
   ARGS="$ARGS --run-interval $RUN_INTERVAL"
 fi
 
+if [ ! -z "$HEALTHCHECK_PORT" ]; then
+  ARGS="$ARGS --healthcheck-port $HEALTHCHECK_PORT"
+fi
+
 exec python cleanup_events.py $ARGS
