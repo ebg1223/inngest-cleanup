@@ -27,6 +27,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
     
     def do_GET(self):
+        global db_last_error
         if self.path == '/health' or self.path == '/':
             # Return 200 OK if the service is healthy
             if self.health_status():
@@ -35,7 +36,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'OK')
             else:
-                global db_last_error
                 with db_health_lock:
                     error_msg = db_last_error if db_last_error else "Service is shutting down"
                 
@@ -124,12 +124,12 @@ class EventCleaner:
     @contextmanager
     def db_retry(self):
         """Context manager for database operations with retry logic"""
+        global db_is_healthy, db_last_error
         retries = 0
         while True:
             try:
                 yield
                 # Update global health status on success
-                global db_is_healthy, db_last_error
                 with db_health_lock:
                     db_is_healthy = True
                     db_last_error = None
@@ -137,7 +137,6 @@ class EventCleaner:
             except psycopg2.Error as e:
                 retries += 1
                 # Update global health status on error
-                global db_is_healthy, db_last_error
                 with db_health_lock:
                     if retries >= self.max_retries:
                         db_is_healthy = False
@@ -152,6 +151,7 @@ class EventCleaner:
                 self.reconnect_db()
 
     def connect_db(self):
+        global db_is_healthy, db_last_error
         self.logger.info("Connecting to database")
         try:
             self.conn = psycopg2.connect(
@@ -162,14 +162,12 @@ class EventCleaner:
             self.conn.set_session(autocommit=True)
             
             # Update global health status
-            global db_is_healthy, db_last_error
             with db_health_lock:
                 db_is_healthy = True
                 db_last_error = None
                 
         except Exception as e:
             # Update global health status
-            global db_is_healthy, db_last_error
             with db_health_lock:
                 db_is_healthy = False
                 db_last_error = str(e)
