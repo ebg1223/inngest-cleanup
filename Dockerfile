@@ -34,15 +34,12 @@ COPY --from=builder /install /usr/local/lib/python3.13/site-packages
 
 # Copy application files
 COPY run.sh .
-RUN chmod +x run.sh
+COPY healthcheck.sh .
+RUN chmod +x run.sh healthcheck.sh
 COPY cleanup_events.py .
 
 # Set a default healthcheck port if not specified at runtime
 ENV HEALTHCHECK_PORT=8080
-
-# Create a healthcheck script that will read the current environment variable value
-RUN echo '#!/bin/sh\ncurl -f http://localhost:${HEALTHCHECK_PORT}/health || exit 1' > /app/healthcheck.sh \
-  && chmod +x /app/healthcheck.sh
 
 # Add healthcheck using the script
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
