@@ -11,6 +11,12 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from contextlib import contextmanager
 from datetime import datetime, timedelta, UTC
+import os
+
+# Global variables for health status
+db_is_healthy = True
+db_last_error = None
+db_health_lock = threading.Lock()
 
 class GracefulExit(Exception):
     pass
@@ -29,10 +35,14 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'OK')
             else:
+                global db_last_error
+                with db_health_lock:
+                    error_msg = db_last_error if db_last_error else "Service is shutting down"
+                
                 self.send_response(503)
                 self.send_header('Content-type', 'text/plain')
                 self.end_headers()
-                self.wfile.write(b'Service Unavailable')
+                self.wfile.write(f"Service Unavailable: {error_msg}".encode('utf-8'))
         else:
             self.send_response(404)
             self.send_header('Content-type', 'text/plain')
@@ -118,9 +128,21 @@ class EventCleaner:
         while True:
             try:
                 yield
+                # Update global health status on success
+                global db_is_healthy, db_last_error
+                with db_health_lock:
+                    db_is_healthy = True
+                    db_last_error = None
                 break
             except psycopg2.Error as e:
                 retries += 1
+                # Update global health status on error
+                global db_is_healthy, db_last_error
+                with db_health_lock:
+                    if retries >= self.max_retries:
+                        db_is_healthy = False
+                        db_last_error = str(e)
+                    
                 if retries >= self.max_retries:
                     self.logger.error(f"Max retries ({self.max_retries}) reached. Error: {e}")
                     raise
@@ -131,12 +153,27 @@ class EventCleaner:
 
     def connect_db(self):
         self.logger.info("Connecting to database")
-        self.conn = psycopg2.connect(
-            self.db_url,
-            cursor_factory=psycopg2.extras.DictCursor
-        )
-        # Enable autocommit for better performance with SKIP LOCKED
-        self.conn.set_session(autocommit=True)
+        try:
+            self.conn = psycopg2.connect(
+                self.db_url,
+                cursor_factory=psycopg2.extras.DictCursor
+            )
+            # Enable autocommit for better performance with SKIP LOCKED
+            self.conn.set_session(autocommit=True)
+            
+            # Update global health status
+            global db_is_healthy, db_last_error
+            with db_health_lock:
+                db_is_healthy = True
+                db_last_error = None
+                
+        except Exception as e:
+            # Update global health status
+            global db_is_healthy, db_last_error
+            with db_health_lock:
+                db_is_healthy = False
+                db_last_error = str(e)
+            raise
 
     def reconnect_db(self):
         """Safely reconnect to the database"""
@@ -145,6 +182,7 @@ class EventCleaner:
                 self.conn.close()
             except:
                 pass
+            self.conn = None
         self.connect_db()
 
     def setup_indexes(self):
@@ -326,9 +364,18 @@ def main():
     # Health status function for healthcheck server
     health_server = None
     if args.healthcheck_port > 0:
+        def health_status_func():
+            # Only report healthy if:
+            # 1. The service isn't exiting
+            # 2. The database connection is healthy
+            global db_is_healthy
+            with db_health_lock:
+                is_healthy = not should_exit and db_is_healthy
+            return is_healthy
+            
         health_server = start_health_server(
             args.healthcheck_port,
-            lambda: not should_exit,  # Service is healthy as long as we're not exiting
+            health_status_func,  # Use our new comprehensive health check function
             logger
         )
 
