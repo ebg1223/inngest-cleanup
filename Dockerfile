@@ -20,9 +20,12 @@ COPY uv.lock .
 # Install dependencies
 RUN uv pip install --no-cache --system .
 
+COPY run.sh .
+
+RUN chmod +x run.sh
+
 # Copy the cleanup script
 COPY cleanup_events.py .
 
 # Default command
-ENTRYPOINT ["python", "cleanup_events.py"]
-
+ENTRYPOINT ["/app/run.sh"]

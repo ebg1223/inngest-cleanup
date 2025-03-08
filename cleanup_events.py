@@ -227,9 +227,9 @@ class EventCleaner:
 def main():
     parser = argparse.ArgumentParser(description='Clean up old events from the database')
     parser.add_argument('--db-url', required=True, help='Database connection URL')
-    parser.add_argument('--retention-days', type=int, default=30, help='Number of days to retain events')
+    parser.add_argument('--retention-days', type=int, default=3, help='Number of days to retain events')
     parser.add_argument('--batch-size', type=int, default=5000, help='Number of events to process in each batch')
-    parser.add_argument('--sleep-seconds', type=float, default=1.0, help='Seconds to sleep between batches')
+    parser.add_argument('--sleep-seconds', type=float, default=0.1, help='Seconds to sleep between batches')
     parser.add_argument('--dry-run', action='store_true', help='Print what would be done without making changes')
     parser.add_argument('--max-retries', type=int, default=3, help='Maximum number of retries for database operations')
     parser.add_argument('--retry-delay', type=int, default=5, help='Delay in seconds between retries')
