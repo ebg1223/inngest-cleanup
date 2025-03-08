@@ -22,7 +22,9 @@ class EventCleaner:
         sleep_seconds=1,
         dry_run=False,
         max_retries=3,
-        retry_delay=5
+        retry_delay=5,
+        logger=None,
+        should_exit_callback=None
     ):
         self.db_url = db_url
         self.retention_days = retention_days
@@ -32,31 +34,35 @@ class EventCleaner:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.conn = None
-        self.logger = None
-        self.should_exit = False
+        self.logger = logger
+        self.should_exit_callback = should_exit_callback
         
-        self.setup_logging()
-        self.setup_signal_handlers()
+        if self.logger is None:
+            self.setup_logging()
+        
         self.connect_db()
         self.setup_indexes()
 
     def setup_logging(self):
         self.logger = logging.getLogger('event_cleaner')
         self.logger.setLevel(logging.INFO)
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(
-            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        )
-        self.logger.addHandler(handler)
+        # Check if the logger already has handlers to avoid duplicates
+        if not self.logger.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(
+                logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            )
+            self.logger.addHandler(handler)
+
+    def check_should_exit(self):
+        if self.should_exit_callback and self.should_exit_callback():
+            return True
+        return False
 
     def setup_signal_handlers(self):
-        def signal_handler(signum, frame):
-            self.logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
-            self.should_exit = True
+        # Removed - signal handlers are now managed at the main level
+        pass
         
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-
     @contextmanager
     def db_retry(self):
         """Context manager for database operations with retry logic"""
@@ -148,7 +154,7 @@ class EventCleaner:
         start_time = time.time()
         
         try:
-            while not self.should_exit:
+            while not self.check_should_exit():
                 with self.db_retry():
                     with self.conn.cursor() as cur:
                         if self.dry_run:
@@ -240,11 +246,14 @@ def main():
     # Set up logging at the top level for interval messages
     logger = logging.getLogger('event_cleaner')
     logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(
-        logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    )
-    logger.addHandler(handler)
+    
+    # Check if the logger already has handlers to avoid duplicates
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        )
+        logger.addHandler(handler)
 
     # Set up signal handler at the top level for graceful shutdown
     should_exit = False
@@ -256,6 +265,10 @@ def main():
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Create a callback function to check exit status
+    def should_exit_check():
+        return should_exit
 
     try:
         while not should_exit:
@@ -268,7 +281,9 @@ def main():
                 sleep_seconds=args.sleep_seconds,
                 dry_run=args.dry_run,
                 max_retries=args.max_retries,
-                retry_delay=args.retry_delay
+                retry_delay=args.retry_delay,
+                logger=logger,
+                should_exit_callback=should_exit_check
             )
 
             try:
