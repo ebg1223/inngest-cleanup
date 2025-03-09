@@ -3,6 +3,7 @@ FROM postgres:17
 RUN apt-get update && apt-get install -y \
     build-essential \
     postgresql-server-dev-all \
+    postgresql-17-cron \
     git \
     clang \
     && git clone https://github.com/pgpartman/pg_partman.git /tmp/pg_partman \
