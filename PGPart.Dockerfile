@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y \
 
 # Create postgresql.conf with required settings
 RUN echo "shared_preload_libraries = 'pg_cron'" > /etc/postgresql/postgresql.conf \
-    && echo "cron.database_name = 'postgres'" >> /etc/postgresql/postgresql.conf
+    && echo "cron.database_name = 'public'" >> /etc/postgresql/postgresql.conf
 
 # Create a script to copy settings during container initialization
 RUN mkdir -p /docker-entrypoint-initdb.d \
