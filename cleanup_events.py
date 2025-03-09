@@ -1,456 +1,349 @@
 #!/usr/bin/env python3
+"""
+Simplified Inngest cleanup script for PostgreSQL.
+Deletes old function runs, unused events, and empty event batches.
+"""
 
-import argparse
-import logging
-import psycopg2
-import psycopg2.extras
-import signal
+import os
 import sys
 import time
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import logging
+import signal
+import psycopg2
+from datetime import datetime, timedelta
 from contextlib import contextmanager
-from datetime import datetime, timedelta, UTC
-import os
 
-# Global variables for health status
-db_is_healthy = True
-db_last_error = None
-db_health_lock = threading.Lock()
+# Configuration from environment variables
+DB_URL = os.getenv('DB_URL')
+RETENTION_DAYS = int(os.getenv('RETENTION_DAYS', '30'))
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', '5000'))
+SLEEP_SECONDS = float(os.getenv('SLEEP_SECONDS', '1.0'))
+RUN_INTERVAL_SECONDS = int(os.getenv('RUN_INTERVAL_SECONDS', '3600'))  # 1 hour default
+DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 
-class GracefulExit(Exception):
-    pass
+# Global state
+should_exit = False
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        self.health_status = kwargs.pop('health_status', lambda: True)
-        super().__init__(*args, **kwargs)
-    
-    def do_GET(self):
-        global db_last_error
-        if self.path == '/health' or self.path == '/':
-            # Return 200 OK if the service is healthy
-            if self.health_status():
-                self.send_response(200)
-                self.send_header('Content-type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'OK')
-            else:
-                with db_health_lock:
-                    error_msg = db_last_error if db_last_error else "Service is shutting down"
-                
-                self.send_response(503)
-                self.send_header('Content-type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(f"Service Unavailable: {error_msg}".encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'Not Found')
-    
-    # Silence log messages for healthcheck requests
-    def log_message(self, format, *args):
-        return
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger('inngest-cleanup')
 
-def health_server_factory(health_status):
-    def handler(*args, **kwargs):
-        return HealthCheckHandler(*args, health_status=health_status, **kwargs)
-    return handler
 
-def start_health_server(port, health_status_func, logger):
-    """Start a health check server in a separate thread"""
-    handler = health_server_factory(health_status_func)
-    server = HTTPServer(('0.0.0.0', port), handler)
-    
-    logger.info(f"Starting health check server on port {port}")
-    
-    # Run the server in a daemon thread
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    
-    return server
+def signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
+    global should_exit
+    logger.info(f"Received signal {signum}, will exit after current batch")
+    should_exit = True
 
-class EventCleaner:
-    def __init__(
-        self,
-        db_url,
-        retention_days,
-        batch_size=5000,
-        sleep_seconds=1,
-        dry_run=False,
-        max_retries=3,
-        retry_delay=5,
-        logger=None,
-        should_exit_callback=None
-    ):
+
+@contextmanager
+def db_retry(max_retries=3, retry_delay=5):
+    """Retry database operations with exponential backoff."""
+    retry_count = 0
+    while True:
+        try:
+            yield
+            break
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            retry_count += 1
+            if retry_count > max_retries:
+                logger.error(f"Max retries exceeded: {e}")
+                raise
+            backoff = retry_delay * (2 ** (retry_count - 1))
+            logger.warning(f"Database error: {e}, retrying in {backoff}s (attempt {retry_count}/{max_retries})")
+            time.sleep(backoff)
+
+
+class Cleaner:
+    def __init__(self, db_url, retention_days, batch_size, sleep_seconds, dry_run=False):
         self.db_url = db_url
         self.retention_days = retention_days
         self.batch_size = batch_size
         self.sleep_seconds = sleep_seconds
         self.dry_run = dry_run
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
         self.conn = None
-        self.logger = logger
-        self.should_exit_callback = should_exit_callback
+        self.cutoff_date = datetime.utcnow() - timedelta(days=retention_days)
         
-        if self.logger is None:
-            self.setup_logging()
-        
+        # Initialize database connection
         self.connect_db()
-        self.setup_indexes()
-
-    def setup_logging(self):
-        self.logger = logging.getLogger('event_cleaner')
-        self.logger.setLevel(logging.INFO)
-        # Check if the logger already has handlers to avoid duplicates
-        if not self.logger.handlers:
-            handler = logging.StreamHandler(sys.stdout)
-            handler.setFormatter(
-                logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-            )
-            self.logger.addHandler(handler)
-
-    def check_should_exit(self):
-        if self.should_exit_callback and self.should_exit_callback():
-            return True
-        return False
-
-    def setup_signal_handlers(self):
-        # Removed - signal handlers are now managed at the main level
-        pass
-        
-    @contextmanager
-    def db_retry(self):
-        """Context manager for database operations with retry logic"""
-        global db_is_healthy, db_last_error
-        retries = 0
-        while True:
-            try:
-                yield
-                # Update global health status on success
-                with db_health_lock:
-                    db_is_healthy = True
-                    db_last_error = None
-                break
-            except psycopg2.Error as e:
-                retries += 1
-                # Update global health status on error
-                with db_health_lock:
-                    if retries >= self.max_retries:
-                        db_is_healthy = False
-                        db_last_error = str(e)
-                    
-                if retries >= self.max_retries:
-                    self.logger.error(f"Max retries ({self.max_retries}) reached. Error: {e}")
-                    raise
-                self.logger.warning(f"Database error (attempt {retries}/{self.max_retries}): {e}")
-                self.logger.info(f"Retrying in {self.retry_delay} seconds...")
-                time.sleep(self.retry_delay)
-                self.reconnect_db()
 
     def connect_db(self):
-        global db_is_healthy, db_last_error
-        self.logger.info("Connecting to database")
+        """Connect to the PostgreSQL database."""
         try:
-            self.conn = psycopg2.connect(
-                self.db_url,
-                cursor_factory=psycopg2.extras.DictCursor,
-                options="-c statement_timeout=60000"  # 60 second timeout for all statements
-            )
-            # Enable autocommit for better performance with SKIP LOCKED
-            self.conn.set_session(autocommit=True)
-            
-            # Update global health status
-            with db_health_lock:
-                db_is_healthy = True
-                db_last_error = None
-                
+            self.conn = psycopg2.connect(self.db_url)
+            self.conn.autocommit = False
+            logger.info("Connected to database")
         except Exception as e:
-            # Update global health status
-            with db_health_lock:
-                db_is_healthy = False
-                db_last_error = str(e)
+            logger.error(f"Failed to connect to database: {e}")
             raise
 
-    def reconnect_db(self):
-        """Safely reconnect to the database"""
+    def close(self):
+        """Close database connection."""
         if self.conn:
-            try:
-                self.conn.close()
-            except:
-                pass
-            self.conn = None
-        self.connect_db()
+            self.conn.close()
+            logger.info("Database connection closed")
 
-    def setup_indexes(self):
-        """Create necessary indexes if they don't exist"""
-        self.logger.info("Ensuring required indexes exist")
-        index_queries = [
-            """
-            CREATE INDEX IF NOT EXISTS idx_events_received_at 
-            ON events (received_at, internal_id);
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_function_runs_event_id 
-            ON function_runs (event_id);
-            """
-        ]
+    def cleanup_function_runs(self):
+        """Delete old function runs in batches."""
+        if self.dry_run:
+            with db_retry():
+                with self.conn.cursor() as cur:
+                    # Count how many function runs would be deleted
+                    cur.execute("""
+                        SELECT COUNT(*) 
+                        FROM function_runs
+                        WHERE run_started_at < %s
+                    """, (self.cutoff_date,))
+                    count = cur.fetchone()[0]
+                    logger.info(f"[DRY RUN] Would delete {count} function runs older than {self.cutoff_date}")
+                    return count
+            return 0
 
-        with self.db_retry():
+        total_deleted = 0
+        
+        with db_retry():
             with self.conn.cursor() as cur:
-                for query in index_queries:
-                    cur.execute(query)
-                    self.logger.info("Created index if it didn't exist")
+                while True:
+                    if should_exit:
+                        break
+                        
+                    # Begin transaction
+                    self.conn.rollback()  # Clear any previous transaction
+                    
+                    # Get batch of old function runs to delete
+                    cur.execute("""
+                        WITH to_delete AS (
+                            SELECT run_id
+                            FROM function_runs
+                            WHERE run_started_at < %s
+                            ORDER BY run_started_at
+                            LIMIT %s
+                        )
+                        DELETE FROM function_runs
+                        WHERE run_id IN (SELECT run_id FROM to_delete)
+                        RETURNING run_id
+                    """, (self.cutoff_date, self.batch_size))
+                    
+                    deleted_count = cur.rowcount
+                    if deleted_count == 0:
+                        logger.info("No more old function runs to delete")
+                        break
+                        
+                    self.conn.commit()
+                    total_deleted += deleted_count
+                    logger.info(f"Deleted {deleted_count} function runs (total: {total_deleted})")
+                    time.sleep(self.sleep_seconds)
+        
+        return total_deleted
 
-    def get_stats(self):
-        """Get statistics about the cleanup operation"""
-        cutoff_date = datetime.now(UTC) - timedelta(days=self.retention_days)
+    def cleanup_events(self):
+        """Delete events with no function run references or that are too old."""
+        if self.dry_run:
+            with db_retry():
+                with self.conn.cursor() as cur:
+                    # Count how many events would be deleted
+                    cur.execute("""
+                        SELECT COUNT(*)
+                        FROM events e
+                        WHERE e.received_at < %s
+                        AND NOT EXISTS (
+                            SELECT 1 
+                            FROM function_runs fr 
+                            WHERE fr.event_id = e.internal_id
+                        )
+                    """, (self.cutoff_date,))
+                    count = cur.fetchone()[0]
+                    logger.info(f"[DRY RUN] Would delete {count} unused events older than {self.cutoff_date}")
+                    return count
+            return 0
+
+        total_deleted = 0
         
-        # Add logging to track progress
-        self.logger.info("Fetching database statistics...")
-        
-        with self.db_retry():
+        with db_retry():
             with self.conn.cursor() as cur:
-                # Use a more optimized query that avoids full table scans if possible
-                cur.execute("""
-                    SELECT 
-                        (SELECT reltuples::bigint FROM pg_class WHERE relname = 'events') as estimated_total,
-                        COUNT(*) FILTER (WHERE received_at < %s) as eligible_events,
-                        MIN(received_at) as oldest_event,
-                        MAX(received_at) as newest_event
-                    FROM events
-                    WHERE received_at IS NOT NULL
-                    LIMIT 1
-                """, (cutoff_date,))
-                stats = cur.fetchone()
-                
-                # If the estimated count is zero or null, fall back to actual count
-                if not stats[0]:
-                    self.logger.info("Getting accurate event count (this may take longer)...")
-                    cur.execute("SELECT COUNT(*) FROM events")
-                    total_count = cur.fetchone()[0]
-                else:
-                    total_count = stats[0]
-                
-                return {
-                    'total_events': total_count,
-                    'eligible_events': stats[1] or 0,  # Handle NULL case
-                    'oldest_event': stats[2],
-                    'newest_event': stats[3]
-                }
-
-    def cleanup(self):
-        """Clean up all old events that are no longer needed"""
-        self.logger.info(f"Starting cleanup with retention period of {self.retention_days} days")
-        
-        try:
-            # Print initial statistics
-            self.logger.info("Getting initial database statistics (this may take a moment)...")
-            stats = self.get_stats()
-            self.logger.info(
-                f"Initial state: {stats['total_events']:,} total events, "
-                f"{stats['eligible_events']:,} eligible for cleanup"
-            )
-            
-            cutoff_date = datetime.now(UTC) - timedelta(days=self.retention_days)
-            total_deleted = 0
-            start_time = time.time()
-            
-            self.logger.info("Beginning cleanup operations...")
-            
-            while not self.check_should_exit():
-                self.logger.info(f"Processing batch of up to {self.batch_size} records...")
-                with self.db_retry():
-                    with self.conn.cursor() as cur:
-                        if self.dry_run:
-                            self.logger.info("Executing dry run query...")
-                            query = """
-                            SELECT COUNT(*) 
+                while True:
+                    if should_exit:
+                        break
+                        
+                    # Begin transaction
+                    self.conn.rollback()  # Clear any previous transaction
+                    
+                    # Get batch of events to delete - either they're old enough AND have no function run reference
+                    cur.execute("""
+                        WITH to_delete AS (
+                            SELECT e.internal_id
                             FROM events e
                             WHERE e.received_at < %s
                             AND NOT EXISTS (
-                                SELECT 1 FROM function_runs fr 
+                                SELECT 1 
+                                FROM function_runs fr 
                                 WHERE fr.event_id = e.internal_id
                             )
-                            AND NOT EXISTS (
-                                SELECT 1 FROM event_batches eb 
-                                WHERE position(encode(e.internal_id, 'hex') in encode(eb.event_ids, 'hex')) > 0
-                            )
-                            LIMIT %s;
-                            """
-                        else:
-                            self.logger.info("Executing delete query...")
-                            # First identify candidates - this allows more efficient querying
-                            query = """
-                            WITH candidates AS (
-                                SELECT e.internal_id
-                                FROM events e
-                                WHERE e.received_at < %s
-                                AND NOT EXISTS (
-                                    SELECT 1 FROM function_runs fr 
-                                    WHERE fr.event_id = e.internal_id
-                                )
-                                AND NOT EXISTS (
-                                    SELECT 1 FROM event_batches eb 
-                                    WHERE position(encode(e.internal_id, 'hex') in encode(eb.event_ids, 'hex')) > 0
-                                )
-                                LIMIT %s
-                            ),
-                            deleted_events AS (
-                                DELETE FROM events e
-                                WHERE e.internal_id IN (SELECT internal_id FROM candidates)
-                                RETURNING 1
-                            )
-                            SELECT COUNT(*) FROM deleted_events;
-                            """
+                            LIMIT %s
+                        )
+                        DELETE FROM events
+                        WHERE internal_id IN (SELECT internal_id FROM to_delete)
+                        RETURNING internal_id
+                    """, (self.cutoff_date, self.batch_size))
+                    
+                    deleted_count = cur.rowcount
+                    if deleted_count == 0:
+                        logger.info("No more unused events to delete")
+                        break
                         
-                        cur.execute(query, (cutoff_date, self.batch_size))
-                        count = cur.fetchone()[0]
-
-                        if not count:
-                            self.logger.info("No more events to clean up")
-                            break
-
-                        if self.dry_run:
-                            self.logger.info(f"Would delete {count} events")
-                        else:
-                            total_deleted += count
-                            elapsed = time.time() - start_time
-                            rate = total_deleted / elapsed if elapsed > 0 else 0
-                            self.logger.info(
-                                f"Deleted {count} events "
-                                f"(Total: {total_deleted:,}, Rate: {rate:.1f} events/sec)"
-                            )
-
-                        if self.sleep_seconds > 0:
-                            time.sleep(self.sleep_seconds)
-
-        except GracefulExit:
-            self.logger.info("Gracefully shutting down...")
+                    self.conn.commit()
+                    total_deleted += deleted_count
+                    logger.info(f"Deleted {deleted_count} unused events (total: {total_deleted})")
+                    time.sleep(self.sleep_seconds)
         
-        if total_deleted > 0:
-            elapsed = time.time() - start_time
-            final_rate = total_deleted / elapsed if elapsed > 0 else 0
-            self.logger.info(
-                f"Cleanup completed: {total_deleted:,} events deleted in "
-                f"{elapsed:.1f} seconds ({final_rate:.1f} events/sec)"
-            )
+        return total_deleted
 
-    def close(self):
-        if self.conn:
-            self.conn.close()
+    def cleanup_event_batches(self):
+        """Delete event batches with no event IDs."""
+        if self.dry_run:
+            with db_retry():
+                with self.conn.cursor() as cur:
+                    # Count how many event batches would be deleted
+                    cur.execute("""
+                        SELECT COUNT(*) 
+                        FROM event_batches 
+                        WHERE event_ids IS NULL OR event_ids = '\\x'
+                    """)
+                    count = cur.fetchone()[0]
+                    logger.info(f"[DRY RUN] Would delete {count} empty event batches")
+                    return count
+            return 0
+
+        total_deleted = 0
+        
+        with db_retry():
+            with self.conn.cursor() as cur:
+                while True:
+                    if should_exit:
+                        break
+                        
+                    # Begin transaction
+                    self.conn.rollback()  # Clear any previous transaction
+                    
+                    # Get batch of empty event batches to delete
+                    cur.execute("""
+                        WITH to_delete AS (
+                            SELECT id 
+                            FROM event_batches 
+                            WHERE event_ids IS NULL OR event_ids = '\\x'
+                            LIMIT %s
+                        )
+                        DELETE FROM event_batches
+                        WHERE id IN (SELECT id FROM to_delete)
+                        RETURNING id
+                    """, (self.batch_size,))
+                    
+                    deleted_count = cur.rowcount
+                    if deleted_count == 0:
+                        logger.info("No more empty event batches to delete")
+                        break
+                        
+                    self.conn.commit()
+                    total_deleted += deleted_count
+                    logger.info(f"Deleted {deleted_count} empty event batches (total: {total_deleted})")
+                    time.sleep(self.sleep_seconds)
+        
+        return total_deleted
+
+    def run_cleanup(self):
+        """Run the complete cleanup process once."""
+        logger.info("Starting cleanup with cutoff date: %s", self.cutoff_date)
+        
+        try:
+            if self.dry_run:
+                logger.info("[DRY RUN] Counting rows that would be deleted (not actually deleting)")
+            
+            # Step 1: Delete old function runs
+            logger.info("Cleaning up old function runs...")
+            function_runs_deleted = self.cleanup_function_runs()
+            
+            # Step 2: Delete unused events
+            logger.info("Cleaning up unused events...")
+            events_deleted = self.cleanup_events()
+            
+            # Step 3: Delete empty event batches
+            logger.info("Cleaning up empty event batches...")
+            batches_deleted = self.cleanup_event_batches()
+            
+            if self.dry_run:
+                logger.info(
+                    "[DRY RUN] Cleanup completed: would delete %d function runs, %d events, %d event batches",
+                    function_runs_deleted or 0,
+                    events_deleted or 0,
+                    batches_deleted or 0
+                )
+            else:
+                logger.info(
+                    "Cleanup completed: %d function runs, %d events, %d event batches deleted",
+                    function_runs_deleted or 0,
+                    events_deleted or 0,
+                    batches_deleted or 0
+                )
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            self.conn.rollback()
+            raise
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Clean up old events from the database')
-    parser.add_argument('--db-url', required=True, help='Database connection URL')
-    parser.add_argument('--retention-days', type=int, default=3, help='Number of days to retain events')
-    parser.add_argument('--batch-size', type=int, default=5000, help='Number of events to process in each batch')
-    parser.add_argument('--sleep-seconds', type=float, default=0.1, help='Seconds to sleep between batches')
-    parser.add_argument('--dry-run', action='store_true', help='Print what would be done without making changes')
-    parser.add_argument('--max-retries', type=int, default=3, help='Maximum number of retries for database operations')
-    parser.add_argument('--retry-delay', type=int, default=5, help='Delay in seconds between retries')
-    parser.add_argument('--run-interval', type=int, default=0, help='Run every N minutes (0 = run once and exit)')
-    parser.add_argument('--healthcheck-port', type=int, default=0, help='Port for healthcheck server (0 = disabled)')
-
-    args = parser.parse_args()
-
-    # Set up logging at the top level for interval messages
-    logger = logging.getLogger('event_cleaner')
-    logger.setLevel(logging.INFO)
-    
-    # Check if the logger already has handlers to avoid duplicates
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(
-            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        )
-        logger.addHandler(handler)
-
-    # Set up signal handler at the top level for graceful shutdown
-    should_exit = False
-    
-    def signal_handler(signum, frame):
-        nonlocal should_exit
-        logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
-        should_exit = True
-    
+    """Main function that sets up signal handlers and runs the cleanup loop."""
+    if not DB_URL:
+        logger.error("DATABASE_URL environment variable is required")
+        sys.exit(1)
+        
+    # Setup signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Create a callback function to check exit status
-    def should_exit_check():
-        return should_exit
-
-    # Health status function for healthcheck server
-    health_server = None
-    if args.healthcheck_port > 0:
-        def health_status_func():
-            # Only report healthy if:
-            # 1. The service isn't exiting
-            # 2. The database connection is healthy
-            global db_is_healthy
-            with db_health_lock:
-                is_healthy = not should_exit and db_is_healthy
-            return is_healthy
-            
-        health_server = start_health_server(
-            args.healthcheck_port,
-            health_status_func,  # Use our new comprehensive health check function
-            logger
-        )
-
+    logger.info("Starting Inngest cleanup service")
+    logger.info(f"Configuration: retention_days={RETENTION_DAYS}, batch_size={BATCH_SIZE}, "
+                f"sleep_seconds={SLEEP_SECONDS}, dry_run={DRY_RUN}")
+    
+    cleaner = None
     try:
+        cleaner = Cleaner(
+            db_url=DB_URL,
+            retention_days=RETENTION_DAYS,
+            batch_size=BATCH_SIZE,
+            sleep_seconds=SLEEP_SECONDS,
+            dry_run=DRY_RUN
+        )
+        
+        # Main loop
         while not should_exit:
             start_time = time.time()
             
-            cleaner = EventCleaner(
-                db_url=args.db_url,
-                retention_days=args.retention_days,
-                batch_size=args.batch_size,
-                sleep_seconds=args.sleep_seconds,
-                dry_run=args.dry_run,
-                max_retries=args.max_retries,
-                retry_delay=args.retry_delay,
-                logger=logger,
-                should_exit_callback=should_exit_check
-            )
-
-            try:
-                cleaner.cleanup()
-            finally:
-                cleaner.close()
-                
-            # If run-interval is 0 or we need to exit, break out of the loop
-            if args.run_interval == 0 or should_exit:
-                break
-                
-            # Calculate the time to sleep until the next run
-            elapsed_time = time.time() - start_time
-            sleep_time = max(0, args.run_interval * 60 - elapsed_time)
+            cleaner.run_cleanup()
             
-            if sleep_time > 0 and not should_exit:
-                logger.info(f"Cleanup completed. Next run in {sleep_time:.1f} seconds")
-                
-                # Sleep in small increments to check for exit signal
-                while sleep_time > 0 and not should_exit:
-                    increment = min(1.0, sleep_time)
-                    time.sleep(increment)
-                    sleep_time -= increment
-    
+            # Sleep until next run interval, but check should_exit frequently
+            elapsed = time.time() - start_time
+            remaining = max(0, RUN_INTERVAL_SECONDS - elapsed)
+            logger.info(f"Cleanup cycle completed in {elapsed:.2f}s, next run in {remaining:.2f}s")
+            
+            # Check for exit signal every second
+            for _ in range(int(remaining)):
+                if should_exit:
+                    break
+                time.sleep(1)
+            
     except Exception as e:
-        logger.error(f"Unhandled exception: {e}")
-        if health_server:
-            health_server.shutdown()
+        logger.error(f"Unexpected error: {e}")
         sys.exit(1)
-    
-    logger.info("Exiting cleanup process")
-    
-    # Shut down health check server if it's running
-    if health_server:
-        logger.info("Shutting down health check server")
-        health_server.shutdown()
+    finally:
+        if cleaner:
+            cleaner.close()
+        logger.info("Cleanup service stopped")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
