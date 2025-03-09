@@ -2,6 +2,7 @@ FROM postgres:17
 
 RUN apt-get update && apt-get install -y \
     build-essential \
+    postgresql-17-cron \
     postgresql-server-dev-all \
     git \
     clang \
