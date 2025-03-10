@@ -1,349 +1,336 @@
 #!/usr/bin/env python3
 """
-Simplified Inngest cleanup script for PostgreSQL.
-Deletes old function runs, unused events, and empty event batches.
+Database Cleanup Script - Direct SQL Implementation
+
+This script directly executes SQL to clean up old events and orphaned records
+without requiring stored procedures in the database.
 """
 
-import os
+import argparse
+import psycopg2
 import sys
 import time
+from datetime import datetime, timedelta, UTC
 import logging
-import signal
-import psycopg2
-from datetime import datetime, timedelta
-from contextlib import contextmanager
 
-# Configuration from environment variables
-DB_URL = os.getenv('DB_URL')
-RETENTION_DAYS = int(os.getenv('RETENTION_DAYS', '30'))
-BATCH_SIZE = int(os.getenv('BATCH_SIZE', '5000'))
-SLEEP_SECONDS = float(os.getenv('SLEEP_SECONDS', '1.0'))
-RUN_INTERVAL_SECONDS = int(os.getenv('RUN_INTERVAL_SECONDS', '3600'))  # 1 hour default
-DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
-
-# Global state
-should_exit = False
-
-# Setup logging
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        # logging.FileHandler("db_cleanup.log"),
+        logging.StreamHandler()
+    ]
 )
-logger = logging.getLogger('inngest-cleanup')
+logger = logging.getLogger(__name__)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Clean up database records')
+    parser.add_argument('--hours', type=int, default=720,
+                        help='Retention period in hours (default: 720 = 30 days)')
+    parser.add_argument('--batch-size', type=int, default=1000,
+                        help='Number of records per batch (default: 1000)')
+    parser.add_argument('--runtime', type=int, default=300,
+                        help='Maximum runtime in seconds (default: 300)')
+    parser.add_argument('--db-url', type=str, 
+                        default='postgresql://username:password@localhost/dbname',
+                        help='Database connection string')
+    parser.add_argument('--mode', type=str, choices=['age', 'orphaned', 'all'], 
+                        default='all', help='Cleanup mode (default: all)')
+    return parser.parse_args()
 
-def signal_handler(signum, frame):
-    """Handle termination signals gracefully."""
-    global should_exit
-    logger.info(f"Received signal {signum}, will exit after current batch")
-    should_exit = True
-
-
-@contextmanager
-def db_retry(max_retries=3, retry_delay=5):
-    """Retry database operations with exponential backoff."""
-    retry_count = 0
-    while True:
-        try:
-            yield
-            break
-        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-            retry_count += 1
-            if retry_count > max_retries:
-                logger.error(f"Max retries exceeded: {e}")
-                raise
-            backoff = retry_delay * (2 ** (retry_count - 1))
-            logger.warning(f"Database error: {e}, retrying in {backoff}s (attempt {retry_count}/{max_retries})")
-            time.sleep(backoff)
-
-
-class Cleaner:
-    def __init__(self, db_url, retention_days, batch_size, sleep_seconds, dry_run=False):
-        self.db_url = db_url
-        self.retention_days = retention_days
-        self.batch_size = batch_size
-        self.sleep_seconds = sleep_seconds
-        self.dry_run = dry_run
-        self.conn = None
-        self.cutoff_date = datetime.utcnow() - timedelta(days=retention_days)
-        
-        # Initialize database connection
-        self.connect_db()
-
-    def connect_db(self):
-        """Connect to the PostgreSQL database."""
-        try:
-            self.conn = psycopg2.connect(self.db_url)
-            self.conn.autocommit = False
-            logger.info("Connected to database")
-        except Exception as e:
-            logger.error(f"Failed to connect to database: {e}")
-            raise
-
-    def close(self):
-        """Close database connection."""
-        if self.conn:
-            self.conn.close()
-            logger.info("Database connection closed")
-
-    def cleanup_function_runs(self):
-        """Delete old function runs in batches."""
-        if self.dry_run:
-            with db_retry():
-                with self.conn.cursor() as cur:
-                    # Count how many function runs would be deleted
-                    cur.execute("""
-                        SELECT COUNT(*) 
-                        FROM function_runs
-                        WHERE run_started_at < %s
-                    """, (self.cutoff_date,))
-                    count = cur.fetchone()[0]
-                    logger.info(f"[DRY RUN] Would delete {count} function runs older than {self.cutoff_date}")
-                    return count
-            return 0
-
-        total_deleted = 0
-        
-        with db_retry():
-            with self.conn.cursor() as cur:
-                while True:
-                    if should_exit:
-                        break
-                        
-                    # Begin transaction
-                    self.conn.rollback()  # Clear any previous transaction
-                    
-                    # Get batch of old function runs to delete
-                    cur.execute("""
-                        WITH to_delete AS (
-                            SELECT run_id
-                            FROM function_runs
-                            WHERE run_started_at < %s
-                            ORDER BY run_started_at
-                            LIMIT %s
-                        )
-                        DELETE FROM function_runs
-                        WHERE run_id IN (SELECT run_id FROM to_delete)
-                        RETURNING run_id
-                    """, (self.cutoff_date, self.batch_size))
-                    
-                    deleted_count = cur.rowcount
-                    if deleted_count == 0:
-                        logger.info("No more old function runs to delete")
-                        break
-                        
-                    self.conn.commit()
-                    total_deleted += deleted_count
-                    logger.info(f"Deleted {deleted_count} function runs (total: {total_deleted})")
-                    time.sleep(self.sleep_seconds)
-        
-        return total_deleted
-
-    def cleanup_events(self):
-        """Delete events with no function run references or that are too old."""
-        if self.dry_run:
-            with db_retry():
-                with self.conn.cursor() as cur:
-                    # Count how many events would be deleted
-                    cur.execute("""
-                        SELECT COUNT(*)
-                        FROM events e
-                        WHERE e.received_at < %s
-                        AND NOT EXISTS (
-                            SELECT 1 
-                            FROM function_runs fr 
-                            WHERE fr.event_id = e.internal_id
-                        )
-                    """, (self.cutoff_date,))
-                    count = cur.fetchone()[0]
-                    logger.info(f"[DRY RUN] Would delete {count} unused events older than {self.cutoff_date}")
-                    return count
-            return 0
-
-        total_deleted = 0
-        
-        with db_retry():
-            with self.conn.cursor() as cur:
-                while True:
-                    if should_exit:
-                        break
-                        
-                    # Begin transaction
-                    self.conn.rollback()  # Clear any previous transaction
-                    
-                    # Get batch of events to delete - either they're old enough AND have no function run reference
-                    cur.execute("""
-                        WITH to_delete AS (
-                            SELECT e.internal_id
-                            FROM events e
-                            WHERE e.received_at < %s
-                            AND NOT EXISTS (
-                                SELECT 1 
-                                FROM function_runs fr 
-                                WHERE fr.event_id = e.internal_id
-                            )
-                            LIMIT %s
-                        )
-                        DELETE FROM events
-                        WHERE internal_id IN (SELECT internal_id FROM to_delete)
-                        RETURNING internal_id
-                    """, (self.cutoff_date, self.batch_size))
-                    
-                    deleted_count = cur.rowcount
-                    if deleted_count == 0:
-                        logger.info("No more unused events to delete")
-                        break
-                        
-                    self.conn.commit()
-                    total_deleted += deleted_count
-                    logger.info(f"Deleted {deleted_count} unused events (total: {total_deleted})")
-                    time.sleep(self.sleep_seconds)
-        
-        return total_deleted
-
-    def cleanup_event_batches(self):
-        """Delete event batches with no event IDs."""
-        if self.dry_run:
-            with db_retry():
-                with self.conn.cursor() as cur:
-                    # Count how many event batches would be deleted
-                    cur.execute("""
-                        SELECT COUNT(*) 
-                        FROM event_batches 
-                        WHERE event_ids IS NULL OR event_ids = '\\x'
-                    """)
-                    count = cur.fetchone()[0]
-                    logger.info(f"[DRY RUN] Would delete {count} empty event batches")
-                    return count
-            return 0
-
-        total_deleted = 0
-        
-        with db_retry():
-            with self.conn.cursor() as cur:
-                while True:
-                    if should_exit:
-                        break
-                        
-                    # Begin transaction
-                    self.conn.rollback()  # Clear any previous transaction
-                    
-                    # Get batch of empty event batches to delete
-                    cur.execute("""
-                        WITH to_delete AS (
-                            SELECT id 
-                            FROM event_batches 
-                            WHERE event_ids IS NULL OR event_ids = '\\x'
-                            LIMIT %s
-                        )
-                        DELETE FROM event_batches
-                        WHERE id IN (SELECT id FROM to_delete)
-                        RETURNING id
-                    """, (self.batch_size,))
-                    
-                    deleted_count = cur.rowcount
-                    if deleted_count == 0:
-                        logger.info("No more empty event batches to delete")
-                        break
-                        
-                    self.conn.commit()
-                    total_deleted += deleted_count
-                    logger.info(f"Deleted {deleted_count} empty event batches (total: {total_deleted})")
-                    time.sleep(self.sleep_seconds)
-        
-        return total_deleted
-
-    def run_cleanup(self):
-        """Run the complete cleanup process once."""
-        logger.info("Starting cleanup with cutoff date: %s", self.cutoff_date)
-        
-        try:
-            if self.dry_run:
-                logger.info("[DRY RUN] Counting rows that would be deleted (not actually deleting)")
-            
-            # Step 1: Delete old function runs
-            logger.info("Cleaning up old function runs...")
-            function_runs_deleted = self.cleanup_function_runs()
-            
-            # Step 2: Delete unused events
-            logger.info("Cleaning up unused events...")
-            events_deleted = self.cleanup_events()
-            
-            # Step 3: Delete empty event batches
-            logger.info("Cleaning up empty event batches...")
-            batches_deleted = self.cleanup_event_batches()
-            
-            if self.dry_run:
-                logger.info(
-                    "[DRY RUN] Cleanup completed: would delete %d function runs, %d events, %d event batches",
-                    function_runs_deleted or 0,
-                    events_deleted or 0,
-                    batches_deleted or 0
-                )
-            else:
-                logger.info(
-                    "Cleanup completed: %d function runs, %d events, %d event batches deleted",
-                    function_runs_deleted or 0,
-                    events_deleted or 0,
-                    batches_deleted or 0
-                )
-            
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-            self.conn.rollback()
-            raise
-
-
-def main():
-    """Main function that sets up signal handlers and runs the cleanup loop."""
-    if not DB_URL:
-        logger.error("DATABASE_URL environment variable is required")
-        sys.exit(1)
-        
-    # Setup signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+def cleanup_by_age(conn, retention_hours, batch_size, max_runtime_seconds):
+    """Clean up old events and their dependent records based on age"""
+    cursor = conn.cursor()
+    start_time = time.time()
+    end_time = start_time + max_runtime_seconds
     
-    logger.info("Starting Inngest cleanup service")
-    logger.info(f"Configuration: retention_days={RETENTION_DAYS}, batch_size={BATCH_SIZE}, "
-                f"sleep_seconds={SLEEP_SECONDS}, dry_run={DRY_RUN}")
+    # Calculate cutoff date
+    cutoff_date = datetime.now(UTC) - timedelta(hours=retention_hours)
     
-    cleaner = None
+    logger.info(f"Starting age-based cleanup. Retention: {retention_hours} hours. Cutoff date: {cutoff_date}")
+    
+    total_events_deleted = 0
+    total_runs_deleted = 0
+    total_finishes_deleted = 0
+    batch_count = 0
+    
     try:
-        cleaner = Cleaner(
-            db_url=DB_URL,
-            retention_days=RETENTION_DAYS,
-            batch_size=BATCH_SIZE,
-            sleep_seconds=SLEEP_SECONDS,
-            dry_run=DRY_RUN
-        )
-        
-        # Main loop
-        while not should_exit:
-            start_time = time.time()
+        while time.time() < end_time:
+            batch_count += 1
+            batch_start = time.time()
             
-            cleaner.run_cleanup()
+            # Find event IDs to delete
+            cursor.execute("""
+                SELECT internal_id
+                FROM events
+                WHERE event_ts < %s
+                ORDER BY event_ts ASC
+                LIMIT %s
+            """, (cutoff_date, batch_size))
             
-            # Sleep until next run interval, but check should_exit frequently
-            elapsed = time.time() - start_time
-            remaining = max(0, RUN_INTERVAL_SECONDS - elapsed)
-            logger.info(f"Cleanup cycle completed in {elapsed:.2f}s, next run in {remaining:.2f}s")
+            old_events = cursor.fetchall()
             
-            # Check for exit signal every second
-            for _ in range(int(remaining)):
-                if should_exit:
-                    break
-                time.sleep(1)
+            if not old_events:
+                logger.info("No more old events to delete")
+                break
+                
+            # Extract internal_ids for the next query
+            internal_ids = [event[0] for event in old_events]
+            
+            # Find function runs associated with these events
+            cursor.execute("""
+                SELECT run_id
+                FROM function_runs
+                WHERE event_id = ANY(%s)
+            """, (internal_ids,))
+            
+            run_ids = [run[0] for run in cursor.fetchall()]
+            
+            # Start a transaction for this batch
+            conn.autocommit = False
+            
+            # Delete function_finishes first
+            if run_ids:
+                cursor.execute("""
+                    DELETE FROM function_finishes
+                    WHERE run_id = ANY(%s)
+                    RETURNING run_id
+                """, (run_ids,))
+                finishes_deleted = len(cursor.fetchall())
+                total_finishes_deleted += finishes_deleted
+                
+                # Delete function_runs
+                cursor.execute("""
+                    DELETE FROM function_runs
+                    WHERE run_id = ANY(%s)
+                    RETURNING run_id
+                """, (run_ids,))
+                runs_deleted = len(cursor.fetchall())
+                total_runs_deleted += runs_deleted
+            else:
+                finishes_deleted = 0
+                runs_deleted = 0
+            
+            # Delete events
+            cursor.execute("""
+                DELETE FROM events
+                WHERE internal_id = ANY(%s)
+                RETURNING event_id
+            """, (internal_ids,))
+            events_deleted = len(cursor.fetchall())
+            total_events_deleted += events_deleted
+            
+            # Commit the transaction
+            conn.commit()
+            conn.autocommit = True
+            
+            batch_duration = time.time() - batch_start
+            logger.info(f"Batch {batch_count}: Deleted {events_deleted} events, {runs_deleted} runs, "
+                        f"{finishes_deleted} finishes in {batch_duration:.2f} seconds")
+            
+            # Small pause to reduce resource contention
+            time.sleep(0.1)
             
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        sys.exit(1)
+        conn.rollback()
+        logger.error(f"Error in age-based cleanup: {e}")
+        raise
     finally:
-        if cleaner:
-            cleaner.close()
-        logger.info("Cleanup service stopped")
+        conn.autocommit = True
+    
+    total_runtime = time.time() - start_time
+    logger.info(f"Age-based cleanup completed in {total_runtime:.2f} seconds. "
+                f"Deleted {total_events_deleted} events, {total_runs_deleted} runs, "
+                f"{total_finishes_deleted} finishes")
+    
+    return {
+        "events_deleted": total_events_deleted,
+        "runs_deleted": total_runs_deleted,
+        "finishes_deleted": total_finishes_deleted
+    }
 
+def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
+    """Clean up orphaned function_runs and function_finishes"""
+    cursor = conn.cursor()
+    start_time = time.time()
+    end_time = start_time + max_runtime_seconds
+    
+    logger.info("Starting orphaned records cleanup")
+    
+    orphaned_run_count = 0
+    related_finish_count = 0
+    orphaned_finish_count = 0
+    batch_count = 0
+    
+    try:
+        # Phase 1: Clean up orphaned function_runs and their dependent function_finishes
+        logger.info("Phase 1: Cleaning up orphaned function_runs")
+        batch_count = 0
+        
+        while time.time() < end_time:
+            batch_count += 1
+            batch_start = time.time()
+            
+            # Find orphaned function_runs
+            cursor.execute("""
+                SELECT r.run_id
+                FROM function_runs r
+                LEFT JOIN events e ON r.event_id = e.internal_id
+                WHERE e.internal_id IS NULL
+                LIMIT %s
+            """, (batch_size,))
+            
+            orphaned_runs = cursor.fetchall()
+            
+            if not orphaned_runs:
+                logger.info("No more orphaned function_runs found")
+                break
+                
+            # Extract run_ids
+            run_ids = [run[0] for run in orphaned_runs]
+            
+            # Start a transaction for this batch
+            conn.autocommit = False
+            
+            # Delete dependent function_finishes first
+            cursor.execute("""
+                DELETE FROM function_finishes
+                WHERE run_id = ANY(%s)
+                RETURNING run_id
+            """, (run_ids,))
+            finishes_deleted = len(cursor.fetchall())
+            related_finish_count += finishes_deleted
+            
+            # Delete orphaned function_runs
+            cursor.execute("""
+                DELETE FROM function_runs
+                WHERE run_id = ANY(%s)
+                RETURNING run_id
+            """, (run_ids,))
+            runs_deleted = len(cursor.fetchall())
+            orphaned_run_count += runs_deleted
+            
+            # Commit the transaction
+            conn.commit()
+            conn.autocommit = True
+            
+            batch_duration = time.time() - batch_start
+            logger.info(f"Batch {batch_count}: Deleted {runs_deleted} orphaned runs and "
+                        f"{finishes_deleted} related finishes in {batch_duration:.2f} seconds")
+            
+            # Small pause to reduce resource contention
+            time.sleep(0.1)
+        
+        # Phase 2: Clean up orphaned function_finishes
+        if time.time() < end_time:
+            logger.info("Phase 2: Cleaning up orphaned function_finishes")
+            batch_count = 0
+            
+            while time.time() < end_time:
+                batch_count += 1
+                batch_start = time.time()
+                
+                # Delete orphaned function_finishes
+                cursor.execute("""
+                    WITH orphaned_finishes AS (
+                        SELECT f.run_id
+                        FROM function_finishes f
+                        LEFT JOIN function_runs r ON f.run_id = r.run_id
+                        WHERE r.run_id IS NULL
+                        LIMIT %s
+                    )
+                    DELETE FROM function_finishes
+                    WHERE run_id IN (SELECT run_id FROM orphaned_finishes)
+                    RETURNING run_id
+                """, (batch_size,))
+                
+                finishes_deleted = len(cursor.fetchall())
+                orphaned_finish_count += finishes_deleted
+                
+                if finishes_deleted == 0:
+                    logger.info("No more orphaned function_finishes found")
+                    break
+                
+                batch_duration = time.time() - batch_start
+                logger.info(f"Batch {batch_count}: Deleted {finishes_deleted} orphaned finishes "
+                            f"in {batch_duration:.2f} seconds")
+                
+                # Small pause to reduce resource contention
+                time.sleep(0.1)
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error in orphaned records cleanup: {e}")
+        raise
+    finally:
+        conn.autocommit = True
+    
+    total_runtime = time.time() - start_time
+    logger.info(f"Orphaned records cleanup completed in {total_runtime:.2f} seconds. "
+                f"Deleted {orphaned_run_count} orphaned runs, {related_finish_count} related finishes, "
+                f"{orphaned_finish_count} orphaned finishes")
+    
+    return {
+        "orphaned_runs_deleted": orphaned_run_count,
+        "related_finishes_deleted": related_finish_count,
+        "orphaned_finishes_deleted": orphaned_finish_count
+    }
+
+def main():
+    args = parse_args()
+    
+    logger.info(f"Database cleanup started at {datetime.now(UTC).isoformat()}")
+    results = {}
+    
+    try:
+        # Connect to the database
+        logger.info(f"Connecting to database: {args.db_url}")
+        conn = psycopg2.connect(args.db_url)
+        
+        # Ensure autocommit is on by default
+        conn.autocommit = True
+        
+        # Run the selected cleanup mode(s)
+        if args.mode in ['age', 'all']:
+            results['age_cleanup'] = cleanup_by_age(
+                conn, args.hours, args.batch_size, 
+                args.runtime if args.mode == 'age' else args.runtime // 2
+            )
+        
+        if args.mode in ['orphaned', 'all']:
+            results['orphaned_cleanup'] = cleanup_orphaned_records(
+                conn, args.batch_size,
+                args.runtime if args.mode == 'orphaned' else args.runtime // 2
+            )
+        
+        conn.close()
+        
+        # Summarize results
+        logger.info("Cleanup Summary:")
+        for mode, result in results.items():
+            logger.info(f"  {mode}: {result}")
+        
+        logger.info(f"Database cleanup completed successfully at {datetime.now(UTC).isoformat()}")
+        return 0
+        
+    except Exception as e:
+        logger.error(f"Database cleanup failed: {e}")
+        logger.info(f"Database cleanup failed at {datetime.now(UTC).isoformat()}")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    # conn = psycopg2.connect("postgresql://postgres:postgrespassword@10.138.0.52/myapp")
+    # cursor = conn.cursor()
+
+    # Find event IDs to delete
+    # cursor.execute("""
+    #     SELECT internal_id
+    #     FROM events
+    #     ORDER BY event_ts ASC
+    #     LIMIT 10
+    # """)
+    
+    # old_events = cursor.fetchall()
+    # print(old_events)
+    sys.exit(main())
