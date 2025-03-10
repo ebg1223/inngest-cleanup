@@ -46,11 +46,11 @@ def parse_args():
         args.mode = 'all'
     
     # Database connection parameters
-    args.db_host = os.environ.get('DB_HOST', 'localhost')
-    args.db_port = int(os.environ.get('DB_PORT', '5432'))
-    args.db_name = os.environ.get('DB_NAME', 'dbname')
-    args.db_user = os.environ.get('DB_USER', 'username')
-    args.db_password = os.environ.get('DB_PASSWORD', 'password')
+    args.db_host = os.environ.get('POSTGRES_HOST', 'localhost')
+    args.db_port = int(os.environ.get('POSTGRES_PORT', '5432'))
+    args.db_name = os.environ.get('POSTGRES_DB', 'dbname')
+    args.db_user = os.environ.get('POSTGRES_USER', 'username')
+    args.db_password = os.environ.get('POSTGRES_PASSWORD', 'password')
     
     logger.info(f"Configuration loaded from environment variables")
     return args
