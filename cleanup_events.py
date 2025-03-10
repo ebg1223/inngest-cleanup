@@ -39,6 +39,7 @@ def parse_args():
     args.batch_size = int(os.environ.get('CLEANUP_BATCH_SIZE', '1000'))
     args.runtime = int(os.environ.get('CLEANUP_MAX_RUNTIME_SECONDS', '300'))
     args.mode = os.environ.get('CLEANUP_MODE', 'all')
+    args.create_indexes = os.environ.get('CREATE_INDEXES', 'true')
     
     # Validate mode
     if args.mode not in ['age', 'orphaned', 'all']:
@@ -293,6 +294,79 @@ def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
         "orphaned_finishes_deleted": orphaned_finish_count
     }
 
+
+def check_and_create_indexes(conn):
+    """Check if necessary indexes exist and create them if needed"""
+    cursor = conn.cursor()
+    created_indexes = []
+    
+    # Define the indexes we need
+    required_indexes = [
+        {
+            "name": "idx_events_event_ts",
+            "table": "events",
+            "columns": "event_ts",
+            "type": ""
+        },
+        {
+            "name": "idx_events_internal_id",
+            "table": "events",
+            "columns": "internal_id",
+            "type": ""
+        },
+        {
+            "name": "idx_function_runs_event_id",
+            "table": "function_runs",
+            "columns": "event_id",
+            "type": ""
+        },
+        {
+            "name": "idx_function_finishes_run_id",
+            "table": "function_finishes",
+            "columns": "run_id",
+            "type": ""
+        }
+    ]
+    
+    try:
+        # Check which indexes exist
+        cursor.execute("""
+            SELECT indexname 
+            FROM pg_indexes 
+            WHERE schemaname = 'public'
+        """)
+        
+        existing_indexes = [row[0] for row in cursor.fetchall()]
+        logger.info(f"Found {len(existing_indexes)} existing indexes")
+        
+        # Create any missing indexes
+        for idx in required_indexes:
+            if idx["name"] not in existing_indexes:
+                logger.info(f"Creating missing index: {idx['name']} on {idx['table']}({idx['columns']})")
+                
+                # Build the CREATE INDEX statement
+                create_statement = f"""
+                    CREATE INDEX {idx['name']} 
+                    ON {idx['table']}({idx['columns']})
+                    {idx['type']}
+                """
+                
+                # Execute CREATE INDEX
+                cursor.execute(create_statement)
+                created_indexes.append(idx["name"])
+                logger.info(f"Created index: {idx['name']}")
+            else:
+                logger.info(f"Index {idx['name']} already exists")
+        
+        conn.commit()
+        return created_indexes
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error creating indexes: {e}")
+        raise
+
+
 def main():
     args = parse_args()
     
@@ -314,6 +388,9 @@ def main():
         
         # Ensure autocommit is on by default
         conn.autocommit = True
+
+        if args.create_indexes == 'true':
+            check_and_create_indexes(conn)
         
         # Run the selected cleanup mode(s)
         if args.mode in ['age', 'all']:
