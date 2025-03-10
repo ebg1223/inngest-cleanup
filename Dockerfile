@@ -1,50 +1,51 @@
-FROM python:3.13-alpine AS builder
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm
 
-# Install build dependencies
-RUN apk add --no-cache \
-  postgresql-dev \
-  gcc \
-  python3-dev \
-  musl-dev
+# Install dependencies
+RUN apt-get update && apt-get install -y curl libpq-dev gcc && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-RUN pip install --no-cache-dir uv
+# Install supercronic for ARM architecture
+ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.2.33/supercronic-linux-arm64 \
+  SUPERCRONIC_SHA1SUM=e0f0c06ebc5627e43b25475711e694450489ab00 \
+  SUPERCRONIC=supercronic-linux-arm64
 
-# Copy dependency files
-WORKDIR /build
-COPY pyproject.toml .
-COPY uv.lock .
+RUN curl -fsSLO "$SUPERCRONIC_URL" \
+  && echo "${SUPERCRONIC_SHA1SUM}  ${SUPERCRONIC}" | sha1sum -c - \
+  && chmod +x "$SUPERCRONIC" \
+  && mv "$SUPERCRONIC" "/usr/local/bin/${SUPERCRONIC}" \
+  && ln -s "/usr/local/bin/${SUPERCRONIC}" /usr/local/bin/supercronic
 
-# The key change: Replace psycopg2-binary with psycopg2 in your pyproject.toml
-# You don't need to do this here if you've already updated the file locally
-
-# Install dependencies to a local directory
-RUN uv pip install --no-cache --system --target=/install .
-
-# Second stage - final image
-FROM python:3.13-alpine
-
-# Runtime dependencies and curl for healthchecks
-RUN apk add --no-cache postgresql-libs curl
-
+# Set up working directory
 WORKDIR /app
 
-# Copy installed packages from builder stage
-COPY --from=builder /install /usr/local/lib/python3.13/site-packages
-
 # Copy application files
-COPY run.sh .
-COPY healthcheck.sh .
-RUN chmod +x run.sh healthcheck.sh
-COPY cleanup_events.py .
+COPY pyproject.toml /app/
+COPY uv.lock /app/
 
-# Set a default healthcheck port if not specified at runtime
-ENV HEALTHCHECK_PORT=8080
+RUN uv pip install --system psycopg2-binary
+RUN uv pip install --system -e .
 
-# Add healthcheck using the script
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD /app/healthcheck.sh
 
-# Default command
-ENTRYPOINT ["/app/run.sh"]
 
+# Create a status file to track job execution
+RUN touch /app/last_success
+
+# Create crontab file with placeholder for environment variable
+# This will be replaced at container start time
+COPY entrypoint.sh /app/
+RUN chmod +x /app/entrypoint.sh
+
+# Set default cron schedule (overridable via environment variable)
+ENV CRON_SCHEDULE="0 * * * *"
+
+COPY healthcheck.py /app/
+RUN chmod +x /app/healthcheck.py
+
+# Configure healthcheck
+HEALTHCHECK --interval=5m --timeout=3s --start-period=5s --retries=3 \
+  CMD python /app/healthcheck.py
+
+COPY cleanup_events.py /app/
+RUN chmod +x /app/cleanup_events.py
+
+# Use entrypoint script to set up dynamic cron schedule
+ENTRYPOINT ["/app/entrypoint.sh"]

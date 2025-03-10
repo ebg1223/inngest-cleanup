@@ -6,7 +6,7 @@ This script directly executes SQL to clean up old events and orphaned records
 without requiring stored procedures in the database.
 """
 
-import argparse
+import os
 import psycopg2
 import sys
 import time
@@ -25,19 +25,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Clean up database records')
-    parser.add_argument('--hours', type=int, default=720,
-                        help='Retention period in hours (default: 720 = 30 days)')
-    parser.add_argument('--batch-size', type=int, default=1000,
-                        help='Number of records per batch (default: 1000)')
-    parser.add_argument('--runtime', type=int, default=300,
-                        help='Maximum runtime in seconds (default: 300)')
-    parser.add_argument('--db-url', type=str, 
-                        default='postgresql://username:password@localhost/dbname',
-                        help='Database connection string')
-    parser.add_argument('--mode', type=str, choices=['age', 'orphaned', 'all'], 
-                        default='all', help='Cleanup mode (default: all)')
-    return parser.parse_args()
+    """
+    Parse configuration from environment variables
+    Returns an object with the same attributes as the argparse version for compatibility
+    """
+    class EnvArgs:
+        pass
+    
+    args = EnvArgs()
+    
+    # Database cleanup parameters
+    args.hours = int(os.environ.get('CLEANUP_RETENTION_HOURS', '720'))
+    args.batch_size = int(os.environ.get('CLEANUP_BATCH_SIZE', '1000'))
+    args.runtime = int(os.environ.get('CLEANUP_MAX_RUNTIME_SECONDS', '300'))
+    args.mode = os.environ.get('CLEANUP_MODE', 'all')
+    
+    # Validate mode
+    if args.mode not in ['age', 'orphaned', 'all']:
+        logger.warning(f"Invalid mode: {args.mode}. Using 'all' instead.")
+        args.mode = 'all'
+    
+    # Database connection parameters
+    args.db_host = os.environ.get('DB_HOST', 'localhost')
+    args.db_port = int(os.environ.get('DB_PORT', '5432'))
+    args.db_name = os.environ.get('DB_NAME', 'dbname')
+    args.db_user = os.environ.get('DB_USER', 'username')
+    args.db_password = os.environ.get('DB_PASSWORD', 'password')
+    
+    logger.info(f"Configuration loaded from environment variables")
+    return args
 
 def cleanup_by_age(conn, retention_hours, batch_size, max_runtime_seconds):
     """Clean up old events and their dependent records based on age"""
@@ -281,12 +297,20 @@ def main():
     args = parse_args()
     
     logger.info(f"Database cleanup started at {datetime.now(UTC).isoformat()}")
+    logger.info(f"Using configuration: retention={args.hours}h, batch_size={args.batch_size}, "
+                f"runtime={args.runtime}s, mode={args.mode}")
     results = {}
     
     try:
         # Connect to the database
-        logger.info(f"Connecting to database: {args.db_url}")
-        conn = psycopg2.connect(args.db_url)
+        logger.info(f"Connecting to database: {args.db_host}:{args.db_port}/{args.db_name}")
+        conn = psycopg2.connect(
+            host=args.db_host,
+            port=args.db_port,
+            dbname=args.db_name,
+            user=args.db_user,
+            password=args.db_password
+        )
         
         # Ensure autocommit is on by default
         conn.autocommit = True
