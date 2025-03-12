@@ -5,6 +5,8 @@ set -e
 echo "Current environment:"
 echo "PATH=$PATH"
 echo "CRON_SCHEDULE=$CRON_SCHEDULE"
+echo "SQLITE_DB_PATH=${SQLITE_DB_PATH:-/app/data/events.db}"
+
 
 # Export all environment variables to a file
 printenv > /app/env.sh
@@ -24,6 +26,9 @@ fi
 
 # Make sure script.py is executable
 chmod +x /app/cleanup_events.py
+
+# Print SQLite database path
+echo "Using SQLite database path: ${SQLITE_DB_PATH:-/app/data/events.db}"
 
 # Start supercronic with the generated crontab
 exec /usr/local/bin/supercronic /app/crontab

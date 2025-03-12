@@ -1,7 +1,7 @@
 [project]
 name = "inngest-cleanup"
 version = "0.1.0"
-description = "Add your description here"
+description = "Database cleanup utility for event data using SQLite"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["psycopg2-binary"]
+dependencies = []

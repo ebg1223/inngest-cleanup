@@ -1,7 +1,7 @@
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm
 
 # Install dependencies
-RUN apt-get update && apt-get install -y curl libpq-dev gcc && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
 # Install supercronic for ARM architecture
 ENV SUPERCRONIC_URL=https://github.com/aptible/supercronic/releases/download/v0.2.33/supercronic-linux-arm64 \
@@ -21,10 +21,7 @@ WORKDIR /app
 COPY pyproject.toml /app/
 COPY uv.lock /app/
 
-RUN uv pip install --system psycopg2-binary
 RUN uv pip install --system -e .
-
-
 
 # Create a status file to track job execution
 RUN touch /app/last_success

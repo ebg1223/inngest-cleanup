@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Database Cleanup Script - Direct SQL Implementation
+Database Cleanup Script - Direct SQL Implementation for SQLite
 
 This script directly executes SQL to clean up old events and orphaned records
-without requiring stored procedures in the database.
+in an SQLite database without requiring stored procedures.
 """
 
 import os
-import psycopg2
+import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, UTC
 import logging
+import pathlib
 
 # Configure logging
 logging.basicConfig(
@@ -46,12 +47,8 @@ def parse_args():
         logger.warning(f"Invalid mode: {args.mode}. Using 'all' instead.")
         args.mode = 'all'
     
-    # Database connection parameters
-    args.db_host = os.environ.get('POSTGRES_HOST', 'localhost')
-    args.db_port = int(os.environ.get('POSTGRES_PORT', '5432'))
-    args.db_name = os.environ.get('POSTGRES_DB', 'dbname')
-    args.db_user = os.environ.get('POSTGRES_USER', 'username')
-    args.db_password = os.environ.get('POSTGRES_PASSWORD', 'password')
+    # Database connection parameters - for SQLite we only need the database path
+    args.db_path = os.environ.get('SQLITE_DB_PATH', 'events.db')
     
     logger.info(f"Configuration loaded from environment variables")
     return args
@@ -64,6 +61,7 @@ def cleanup_by_age(conn, retention_hours, batch_size, max_runtime_seconds):
     
     # Calculate cutoff date
     cutoff_date = datetime.now(UTC) - timedelta(hours=retention_hours)
+    cutoff_iso = cutoff_date.isoformat()
     
     logger.info(f"Starting age-based cleanup. Retention: {retention_hours} hours. Cutoff date: {cutoff_date}")
     
@@ -81,10 +79,10 @@ def cleanup_by_age(conn, retention_hours, batch_size, max_runtime_seconds):
             cursor.execute("""
                 SELECT internal_id
                 FROM events
-                WHERE event_ts < %s
+                WHERE event_ts < ?
                 ORDER BY event_ts ASC
-                LIMIT %s
-            """, (cutoff_date, batch_size))
+                LIMIT ?
+            """, (cutoff_iso, batch_size))
             
             old_events = cursor.fetchall()
             
@@ -94,53 +92,53 @@ def cleanup_by_age(conn, retention_hours, batch_size, max_runtime_seconds):
                 
             # Extract internal_ids for the next query
             internal_ids = [event[0] for event in old_events]
+            internal_ids_str = ', '.join(['?' for _ in internal_ids])
             
             # Find function runs associated with these events
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT run_id
                 FROM function_runs
-                WHERE event_id = ANY(%s)
-            """, (internal_ids,))
+                WHERE event_id IN ({internal_ids_str})
+            """, internal_ids)
             
             run_ids = [run[0] for run in cursor.fetchall()]
             
             # Start a transaction for this batch
-            conn.autocommit = False
+            conn.execute("BEGIN TRANSACTION")
             
             # Delete function_finishes first
             if run_ids:
-                cursor.execute("""
+                run_ids_str = ', '.join(['?' for _ in run_ids])
+                
+                # Delete function_finishes - SQLite doesn't support RETURNING clause
+                cursor.execute(f"""
                     DELETE FROM function_finishes
-                    WHERE run_id = ANY(%s)
-                    RETURNING run_id
-                """, (run_ids,))
-                finishes_deleted = len(cursor.fetchall())
+                    WHERE run_id IN ({run_ids_str})
+                """, run_ids)
+                finishes_deleted = cursor.rowcount
                 total_finishes_deleted += finishes_deleted
                 
                 # Delete function_runs
-                cursor.execute("""
+                cursor.execute(f"""
                     DELETE FROM function_runs
-                    WHERE run_id = ANY(%s)
-                    RETURNING run_id
-                """, (run_ids,))
-                runs_deleted = len(cursor.fetchall())
+                    WHERE run_id IN ({run_ids_str})
+                """, run_ids)
+                runs_deleted = cursor.rowcount
                 total_runs_deleted += runs_deleted
             else:
                 finishes_deleted = 0
                 runs_deleted = 0
             
             # Delete events
-            cursor.execute("""
+            cursor.execute(f"""
                 DELETE FROM events
-                WHERE internal_id = ANY(%s)
-                RETURNING event_id
-            """, (internal_ids,))
-            events_deleted = len(cursor.fetchall())
+                WHERE internal_id IN ({internal_ids_str})
+            """, internal_ids)
+            events_deleted = cursor.rowcount
             total_events_deleted += events_deleted
             
             # Commit the transaction
             conn.commit()
-            conn.autocommit = True
             
             batch_duration = time.time() - batch_start
             logger.info(f"Batch {batch_count}: Deleted {events_deleted} events, {runs_deleted} runs, "
@@ -153,8 +151,6 @@ def cleanup_by_age(conn, retention_hours, batch_size, max_runtime_seconds):
         conn.rollback()
         logger.error(f"Error in age-based cleanup: {e}")
         raise
-    finally:
-        conn.autocommit = True
     
     total_runtime = time.time() - start_time
     logger.info(f"Age-based cleanup completed in {total_runtime:.2f} seconds. "
@@ -195,7 +191,7 @@ def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
                 FROM function_runs r
                 LEFT JOIN events e ON r.event_id = e.internal_id
                 WHERE e.internal_id IS NULL
-                LIMIT %s
+                LIMIT ?
             """, (batch_size,))
             
             orphaned_runs = cursor.fetchall()
@@ -206,31 +202,29 @@ def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
                 
             # Extract run_ids
             run_ids = [run[0] for run in orphaned_runs]
+            run_ids_str = ', '.join(['?' for _ in run_ids])
             
             # Start a transaction for this batch
-            conn.autocommit = False
+            conn.execute("BEGIN TRANSACTION")
             
-            # Delete dependent function_finishes first
-            cursor.execute("""
+            # Delete dependent function_finishes first - SQLite doesn't support RETURNING
+            cursor.execute(f"""
                 DELETE FROM function_finishes
-                WHERE run_id = ANY(%s)
-                RETURNING run_id
-            """, (run_ids,))
-            finishes_deleted = len(cursor.fetchall())
+                WHERE run_id IN ({run_ids_str})
+            """, run_ids)
+            finishes_deleted = cursor.rowcount
             related_finish_count += finishes_deleted
             
             # Delete orphaned function_runs
-            cursor.execute("""
+            cursor.execute(f"""
                 DELETE FROM function_runs
-                WHERE run_id = ANY(%s)
-                RETURNING run_id
-            """, (run_ids,))
-            runs_deleted = len(cursor.fetchall())
+                WHERE run_id IN ({run_ids_str})
+            """, run_ids)
+            runs_deleted = cursor.rowcount
             orphaned_run_count += runs_deleted
             
             # Commit the transaction
             conn.commit()
-            conn.autocommit = True
             
             batch_duration = time.time() - batch_start
             logger.info(f"Batch {batch_count}: Deleted {runs_deleted} orphaned runs and "
@@ -248,21 +242,20 @@ def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
                 batch_count += 1
                 batch_start = time.time()
                 
-                # Delete orphaned function_finishes
+                # Delete orphaned function_finishes - SQLite doesn't support CTEs (WITH) like PostgreSQL
+                # So we need to use a subquery approach
                 cursor.execute("""
-                    WITH orphaned_finishes AS (
+                    DELETE FROM function_finishes
+                    WHERE run_id IN (
                         SELECT f.run_id
                         FROM function_finishes f
                         LEFT JOIN function_runs r ON f.run_id = r.run_id
                         WHERE r.run_id IS NULL
-                        LIMIT %s
+                        LIMIT ?
                     )
-                    DELETE FROM function_finishes
-                    WHERE run_id IN (SELECT run_id FROM orphaned_finishes)
-                    RETURNING run_id
                 """, (batch_size,))
                 
-                finishes_deleted = len(cursor.fetchall())
+                finishes_deleted = cursor.rowcount
                 orphaned_finish_count += finishes_deleted
                 
                 if finishes_deleted == 0:
@@ -280,8 +273,6 @@ def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
         conn.rollback()
         logger.error(f"Error in orphaned records cleanup: {e}")
         raise
-    finally:
-        conn.autocommit = True
     
     total_runtime = time.time() - start_time
     logger.info(f"Orphaned records cleanup completed in {total_runtime:.2f} seconds. "
@@ -329,11 +320,10 @@ def check_and_create_indexes(conn):
     ]
     
     try:
-        # Check which indexes exist
+        # Check which indexes exist - SQLite approach
         cursor.execute("""
-            SELECT indexname 
-            FROM pg_indexes 
-            WHERE schemaname = 'public'
+            SELECT name FROM sqlite_master 
+            WHERE type = 'index' AND sql IS NOT NULL
         """)
         
         existing_indexes = [row[0] for row in cursor.fetchall()]
@@ -376,18 +366,16 @@ def main():
     results = {}
     
     try:
-        # Connect to the database
-        logger.info(f"Connecting to database: {args.db_host}:{args.db_port}/{args.db_name}")
-        conn = psycopg2.connect(
-            host=args.db_host,
-            port=args.db_port,
-            dbname=args.db_name,
-            user=args.db_user,
-            password=args.db_password
-        )
+        # Make sure the database directory exists
+        db_dir = pathlib.Path(args.db_path).parent
+        db_dir.mkdir(parents=True, exist_ok=True)
         
-        # Ensure autocommit is on by default
-        conn.autocommit = True
+        # Connect to the SQLite database
+        logger.info(f"Connecting to SQLite database: {args.db_path}")
+        conn = sqlite3.connect(args.db_path)
+        
+        # Enable foreign keys
+        conn.execute("PRAGMA foreign_keys = ON")
 
         if args.create_indexes == 'true':
             check_and_create_indexes(conn)
@@ -421,17 +409,4 @@ def main():
         return 1
 
 if __name__ == "__main__":
-    # conn = psycopg2.connect("postgresql://postgres:postgrespassword@10.138.0.52/myapp")
-    # cursor = conn.cursor()
-
-    # Find event IDs to delete
-    # cursor.execute("""
-    #     SELECT internal_id
-    #     FROM events
-    #     ORDER BY event_ts ASC
-    #     LIMIT 10
-    # """)
-    
-    # old_events = cursor.fetchall()
-    # print(old_events)
     sys.exit(main())

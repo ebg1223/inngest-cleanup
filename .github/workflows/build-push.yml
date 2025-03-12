@@ -9,6 +9,8 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - PGPart.Dockerfile
 env:
   IMAGE_NAME: inngest-cleaner
 #
