@@ -25,6 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+PAUSE_TIME = 0.4
+
 def parse_args():
     """
     Parse configuration from environment variables.
@@ -145,7 +147,7 @@ def cleanup_by_age(conn, retention_hours, batch_size, max_runtime_seconds):
                         f"{finishes_deleted} finishes in {batch_duration:.2f} seconds")
             
             # Small pause to reduce resource contention
-            time.sleep(0.4)
+            time.sleep(PAUSE_TIME)
             
     except Exception as e:
         conn.rollback()
@@ -231,7 +233,7 @@ def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
                         f"{finishes_deleted} related finishes in {batch_duration:.2f} seconds")
             
             # Small pause to reduce resource contention
-            time.sleep(0.1)
+            time.sleep(PAUSE_TIME)
         
         # Phase 2: Clean up orphaned function_finishes
         if time.time() < end_time:
@@ -266,7 +268,7 @@ def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
                             f"in {batch_duration:.2f} seconds")
                 
                 # Small pause to reduce resource contention
-                time.sleep(0.1)
+                time.sleep(PAUSE_TIME)
         
     except Exception as e:
         conn.rollback()
