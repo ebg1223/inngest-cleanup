@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     """
-    Parse configuration from environment variables
-    Returns an object with the same attributes as the argparse version for compatibility
+    Parse configuration from environment variables.
+    Returns an object with the same attributes as the argparse version for compatibility.
     """
     class EnvArgs:
         pass
@@ -50,7 +50,7 @@ def parse_args():
     # Database connection parameters - for SQLite we only need the database path
     args.db_path = os.environ.get('SQLITE_DB_PATH', 'events.db')
     
-    logger.info(f"Configuration loaded from environment variables")
+    logger.info("Configuration loaded from environment variables")
     return args
 
 def cleanup_by_age(conn, retention_hours, batch_size, max_runtime_seconds):
@@ -207,7 +207,7 @@ def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
             # Start a transaction for this batch
             conn.execute("BEGIN TRANSACTION")
             
-            # Delete dependent function_finishes first - SQLite doesn't support RETURNING
+            # Delete dependent function_finishes first
             cursor.execute(f"""
                 DELETE FROM function_finishes
                 WHERE run_id IN ({run_ids_str})
@@ -242,8 +242,7 @@ def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
                 batch_count += 1
                 batch_start = time.time()
                 
-                # Delete orphaned function_finishes - SQLite doesn't support CTEs (WITH) like PostgreSQL
-                # So we need to use a subquery approach
+                # Delete orphaned function_finishes using a subquery
                 cursor.execute("""
                     DELETE FROM function_finishes
                     WHERE run_id IN (
@@ -284,7 +283,6 @@ def cleanup_orphaned_records(conn, batch_size, max_runtime_seconds):
         "related_finishes_deleted": related_finish_count,
         "orphaned_finishes_deleted": orphaned_finish_count
     }
-
 
 def check_and_create_indexes(conn):
     """Check if necessary indexes exist and create them if needed"""
@@ -356,7 +354,6 @@ def check_and_create_indexes(conn):
         logger.error(f"Error creating indexes: {e}")
         raise
 
-
 def main():
     args = parse_args()
     
@@ -370,9 +367,10 @@ def main():
         db_dir = pathlib.Path(args.db_path).parent
         db_dir.mkdir(parents=True, exist_ok=True)
         
-        # Connect to the SQLite database
+        # Connect to the SQLite database with a busy timeout set (5000ms)
         logger.info(f"Connecting to SQLite database: {args.db_path}")
-        conn = sqlite3.connect(args.db_path)
+        conn = sqlite3.connect(args.db_path, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout = 5000")
         
         # Enable foreign keys
         conn.execute("PRAGMA foreign_keys = ON")
