@@ -145,7 +145,7 @@ def cleanup_by_age(conn, retention_hours, batch_size, max_runtime_seconds):
                         f"{finishes_deleted} finishes in {batch_duration:.2f} seconds")
             
             # Small pause to reduce resource contention
-            time.sleep(0.1)
+            time.sleep(0.4)
             
     except Exception as e:
         conn.rollback()
