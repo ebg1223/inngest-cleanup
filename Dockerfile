@@ -41,8 +41,8 @@ RUN chmod +x /app/healthcheck.py
 HEALTHCHECK --interval=5m --timeout=3s --start-period=5s --retries=3 \
   CMD python /app/healthcheck.py
 
-COPY cleanup_events.py /app/
-RUN chmod +x /app/cleanup_events.py
+COPY cleanupv2.py /app/
+RUN chmod +x /app/cleanupv2.py
 
 # Use entrypoint script to set up dynamic cron schedule
 ENTRYPOINT ["/app/entrypoint.sh"]
