@@ -7,7 +7,7 @@ import os
 # Configure logging for detailed output
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-BATCH_SIZE = 10000  # Adjust the batch size as needed
+BATCH_SIZE = 6000  # Adjust the batch size as needed
 
 def get_db_connection():
     # Replace with your actual database connection parameters
@@ -138,18 +138,21 @@ def cleanup_events(conn, cutoff, batch_size=BATCH_SIZE):
 
 def cleanup_trace_data(conn, cutoff, batch_size=BATCH_SIZE):
     """
-    Cleanup trace_runs and associated traces where ended_at (converted to timestamp) is older than the cutoff.
+    Cleanup trace_runs and associated traces where ended_at (in milliseconds) is older than the cutoff.
     Returns the number of trace_run rows processed.
     """
+    # Convert cutoff datetime to Unix timestamp in milliseconds
+    cutoff_ms = int(cutoff.timestamp() * 1000)
+    
     with conn.cursor() as cur:
         cur.execute("""
             SELECT run_id
             FROM public.trace_runs
             WHERE ended_at IS NOT NULL
-              AND to_timestamp(ended_at) < %s
+              AND ended_at < %s
             ORDER BY ended_at ASC
             LIMIT %s
-        """, (cutoff, batch_size))
+        """, (cutoff_ms, batch_size))
         rows = cur.fetchall()
         trace_run_ids = [row[0] for row in rows]
 
@@ -241,7 +244,7 @@ def main():
     logging.info("Starting batch cleanup process.")
     conn = get_db_connection()
     try:
-        cutoff = datetime.utcnow() - timedelta(hours=11)
+        cutoff = datetime.utcnow() - timedelta(hours=int(os.environ["CLEANUP_RETENTION_HOURS"]))
         create_indexes(conn)
 
         # Setup state tracking for each cleanup operation.
@@ -275,7 +278,6 @@ def main():
 
             logging.info("Current task state: %s", tasks_state)
             time.sleep(0.4)
-            i+=1
 
         logging.info("All cleanup operations complete.")
         # Run maintenance in a separate connection with autocommit=True
