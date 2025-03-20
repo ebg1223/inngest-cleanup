@@ -7,7 +7,7 @@ import os
 # Configure logging for detailed output
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-BATCH_SIZE = 1000  # Adjust the batch size as needed
+BATCH_SIZE = 10000  # Adjust the batch size as needed
 
 def get_db_connection():
     # Replace with your actual database connection parameters
@@ -29,22 +29,24 @@ def create_indexes(conn):
       - idx_function_runs_event_id on function_runs(event_id)
     """
     indexes = [
-        ("idx_function_finishes_created_at", "CREATE INDEX idx_function_finishes_created_at ON public.function_finishes(created_at)"),
-        ("idx_function_runs_original_run_id", "CREATE INDEX idx_function_runs_original_run_id ON public.function_runs(original_run_id)"),
-        ("idx_history_run_id", "CREATE INDEX idx_history_run_id ON public.history(run_id)"),
-        ("idx_traces_run_id", "CREATE INDEX idx_traces_run_id ON public.traces(run_id)"),
-        ("idx_trace_runs_ended_at", "CREATE INDEX idx_trace_runs_ended_at ON public.trace_runs(ended_at)"),
-        ("idx_events_received_at", "CREATE INDEX idx_events_received_at ON public.events(received_at)"),
-        ("idx_events_internal_id", "CREATE INDEX idx_events_internal_id ON public.events(internal_id)"),
-        ("idx_function_runs_event_id", "CREATE INDEX idx_function_runs_event_id ON public.function_runs(event_id)")
+        ("idx_function_finishes_created_at", "CREATE INDEX IF NOT EXISTS idx_function_finishes_created_at ON public.function_finishes(created_at)"),
+        ("idx_function_runs_original_run_id", "CREATE INDEX IF NOT EXISTS idx_function_runs_original_run_id ON public.function_runs(original_run_id)"),
+        ("idx_history_run_id", "CREATE INDEX IF NOT EXISTS idx_history_run_id ON public.history(run_id)"),
+        ("idx_traces_run_id", "CREATE INDEX IF NOT EXISTS idx_traces_run_id ON public.traces(run_id)"),
+        ("idx_trace_runs_ended_at", "CREATE INDEX IF NOT EXISTS idx_trace_runs_ended_at ON public.trace_runs(ended_at)"),
+        ("idx_events_received_at", "CREATE INDEX IF NOT EXISTS idx_events_received_at ON public.events(received_at)"),
+        ("idx_events_internal_id", "CREATE INDEX IF NOT EXISTS idx_events_internal_id ON public.events(internal_id)"),
+        ("idx_function_runs_event_id", "CREATE INDEX IF NOT EXISTS idx_function_runs_event_id ON public.function_runs(event_id)")
     ]
     with conn.cursor() as cur:
         for index_name, index_sql in indexes:
-            cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s", (index_name,))
-            if not cur.fetchone():
-                logging.info("Creating index: %s", index_name)
+            try:
+                logging.info("Creating index if not exists: %s", index_name)
                 cur.execute(index_sql)
                 conn.commit()
+            except psycopg2.errors.DuplicateTable:
+                conn.rollback()
+                logging.info("Index %s already exists.", index_name)
     logging.info("Index creation complete.")
 
 def cleanup_function_data(conn, cutoff, batch_size=BATCH_SIZE):
@@ -83,7 +85,7 @@ def cleanup_function_data(conn, cutoff, batch_size=BATCH_SIZE):
     logging.info("Processed %d function-data rows.", len(run_ids))
     return len(run_ids)
 
-def cleanup_events(conn, batch_size=BATCH_SIZE):
+def cleanup_events(conn, cutoff, batch_size=BATCH_SIZE):
     """
     Cleanup orphaned events (i.e. events not referenced by any function_run).
     Returns the number of events deleted.
@@ -97,13 +99,22 @@ def cleanup_events(conn, batch_size=BATCH_SIZE):
                     SELECT 1 FROM public.function_runs fr
                     WHERE fr.event_id = e.internal_id
                 )
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.history h
+                    WHERE h.event_id = e.internal_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.event_batches eb 
+                    WHERE POSITION(CAST(e.internal_id AS TEXT) IN CAST(eb.event_ids AS TEXT)) > 0
+                )
+                AND e.received_at < %s
                 ORDER BY e.received_at ASC
                 LIMIT %s
             )
             DELETE FROM public.events
             WHERE ctid IN (SELECT ctid FROM del)
             RETURNING 1;
-        """, (batch_size,))
+        """, (cutoff, batch_size))
         deleted = cur.rowcount
         conn.commit()
 
@@ -143,10 +154,15 @@ def run_maintenance(conn):
     Run maintenance tasks on cleaned tables:
       - VACUUM ANALYZE to reclaim space and update statistics.
       - REINDEX indexes concurrently to rebuild indexes with minimal locking.
+    
+    Note: For VACUUM operations we need a separate connection with autocommit enabled.
     """
-    logging.info("Starting maintenance: VACUUM ANALYZE and REINDEX concurrently.")
-    # VACUUM and REINDEX must run outside of an explicit transaction.
-    conn.autocommit = True
+    logging.info("Starting maintenance tasks.")
+    
+    # Create a new connection in autocommit mode for VACUUM operations
+    maintenance_conn = get_db_connection()
+    maintenance_conn.autocommit = True
+    
     maintenance_tables = [
         "public.function_runs",
         "public.function_finishes",
@@ -155,27 +171,36 @@ def run_maintenance(conn):
         "public.trace_runs",
         "public.traces"
     ]
-    with conn.cursor() as cur:
-        for table in maintenance_tables:
-            logging.info("Vacuuming and analyzing table: %s", table)
-            cur.execute(f"VACUUM ANALYZE {table};")
-    # List of indexes to reindex concurrently
-    indexes = [
-        "idx_function_finishes_created_at",
-        "idx_function_runs_original_run_id",
-        "idx_history_run_id",
-        "idx_traces_run_id",
-        "idx_trace_runs_ended_at",
-        "idx_events_received_at",
-        "idx_events_internal_id",
-        "idx_function_runs_event_id"
-    ]
-    with conn.cursor() as cur:
-        for index in indexes:
-            logging.info("Reindexing index concurrently: %s", index)
-            cur.execute(f"REINDEX INDEX CONCURRENTLY {index};")
-    conn.autocommit = False
-    logging.info("Maintenance complete.")
+    
+    try:
+        with maintenance_conn.cursor() as cur:
+            for table in maintenance_tables:
+                logging.info("Vacuuming and analyzing table: %s", table)
+                cur.execute(f"VACUUM ANALYZE {table};")
+                
+        # List of indexes to reindex concurrently
+        indexes = [
+            "idx_function_finishes_created_at",
+            "idx_function_runs_original_run_id",
+            "idx_history_run_id",
+            "idx_traces_run_id",
+            "idx_trace_runs_ended_at",
+            "idx_events_received_at",
+            "idx_events_internal_id",
+            "idx_function_runs_event_id"
+        ]
+        
+        with maintenance_conn.cursor() as cur:
+            for index in indexes:
+                logging.info("Reindexing index concurrently: %s", index)
+                cur.execute(f"REINDEX INDEX CONCURRENTLY {index};")
+                
+        logging.info("Maintenance complete.")
+    except Exception as e:
+        logging.exception("Error during maintenance: %s", e)
+    finally:
+        maintenance_conn.close()
+        logging.info("Maintenance connection closed.")
 
 def main():
     logging.info("Starting batch cleanup process.")
@@ -197,27 +222,29 @@ def main():
                 if count < BATCH_SIZE:
                     tasks_state["function_data"] = False
                     logging.info("Function data cleanup complete.")
-                time.sleep(0.5)
+                time.sleep(0.2)
 
             if tasks_state["events"]:
-                count = cleanup_events(conn)
+                count = cleanup_events(conn, cutoff)
                 if count < BATCH_SIZE:
                     tasks_state["events"] = False
-                    logging.info("Orphan events cleanup complete.")
-                time.sleep(0.5)
+                    lograceging.info("Orphan events cleanup complete.")
+                time.sleep(0.2)
 
             if tasks_state["trace_data"]:
                 count = cleanup_trace_data(conn, cutoff)
                 if count < BATCH_SIZE:
-                    tasks_state["trace_data"] = False
+                    tasks_state["t_data"] = False
                     logging.info("Trace data cleanup complete.")
-                time.sleep(0.5)
+                time.sleep(0.2)
 
             logging.info("Current task state: %s", tasks_state)
-            time.sleep(1)
+            time.sleep(0.4)
 
         logging.info("All cleanup operations complete.")
-        run_maintenance(conn)
+        
+        # Run maintenance in a separate connection with autocommit=True
+        # run_maintenance(conn)
 
     except Exception as e:
         logging.exception("Error during cleanup: %s", e)
