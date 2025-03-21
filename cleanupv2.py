@@ -289,7 +289,7 @@ def main():
         
         # Check if time is between 10pm (22:00) and 7am (07:00)
         phoenix_hour = phoenix_time.hour
-        maintenance_window = phoenix_hour >= 22 or phoenix_hour < 7
+        maintenance_window = phoenix_hour == 4#phoenix_hour >= 22 or phoenix_hour < 7
         run_maintenance(perform_vacuum=True, perform_reindex=maintenance_window)
 
     except Exception as e:
