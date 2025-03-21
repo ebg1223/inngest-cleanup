@@ -205,7 +205,7 @@ def run_maintenance( perform_vacuum=True, perform_reindex=True):
             "idx_traces_run_id",
             "idx_trace_runs_ended_at",
             "idx_events_received_at",
-            "idx_events_internal_id",
+            "idx_events_internal_id_hash",
             "idx_function_runs_event_id",
             "idx_events_event_id",
             "idx_history_event_id",
