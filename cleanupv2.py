@@ -7,7 +7,7 @@ import os
 # Configure logging for detailed output
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-BATCH_SIZE = 6000  # Adjust the batch size as needed
+BATCH_SIZE = os.environ.get("BATCH_SIZE", 6000)  # Adjust the batch size as needed
 
 def get_db_connection():
     # Replace with your actual database connection parameters
