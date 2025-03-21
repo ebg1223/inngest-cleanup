@@ -22,7 +22,7 @@ def create_indexes(conn):
         ("idx_traces_run_id", "CREATE INDEX IF NOT EXISTS idx_traces_run_id ON public.traces(run_id)"),
         ("idx_trace_runs_ended_at", "CREATE INDEX IF NOT EXISTS idx_trace_runs_ended_at ON public.trace_runs(ended_at)"),
         ("idx_events_received_at", "CREATE INDEX IF NOT EXISTS idx_events_received_at ON public.events(received_at)"),
-        ("idx_events_internal_id", "CREATE INDEX IF NOT EXISTS idx_events_internal_id ON public.events(internal_id)"),
+        ("idx_events_internal_id_hash", "CREATE INDEX IF NOT EXISTS idx_events_internal_id_hash ON public.events USING hash(internal_id)"),
         ("idx_function_runs_event_id", "CREATE INDEX IF NOT EXISTS idx_function_runs_event_id ON public.function_runs(event_id)"),
         ("idx_events_event_id", "CREATE INDEX IF NOT EXISTS idx_events_event_id ON public.events(event_id)"),
         ("idx_history_event_id", "CREATE INDEX IF NOT EXISTS idx_history_event_id ON public.history(event_id)"),
