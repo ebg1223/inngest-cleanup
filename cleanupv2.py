@@ -16,19 +16,28 @@ def get_db_connection():
 
 def create_indexes(conn):
     indexes = [
-        ("idx_function_finishes_created_at", "CREATE INDEX IF NOT EXISTS idx_function_finishes_created_at ON public.function_finishes(created_at)"),
-        ("idx_function_runs_original_run_id", "CREATE INDEX IF NOT EXISTS idx_function_runs_original_run_id ON public.function_runs(original_run_id)"),
-        ("idx_history_run_id", "CREATE INDEX IF NOT EXISTS idx_history_run_id ON public.history(run_id)"),
-        ("idx_traces_run_id", "CREATE INDEX IF NOT EXISTS idx_traces_run_id ON public.traces(run_id)"),
-        ("idx_trace_runs_ended_at", "CREATE INDEX IF NOT EXISTS idx_trace_runs_ended_at ON public.trace_runs(ended_at)"),
-        ("idx_events_received_at", "CREATE INDEX IF NOT EXISTS idx_events_received_at ON public.events(received_at)"),
-        ("idx_events_internal_id_hash", "CREATE INDEX IF NOT EXISTS idx_events_internal_id_hash ON public.events USING hash(internal_id)"),
-        ("idx_function_runs_event_id", "CREATE INDEX IF NOT EXISTS idx_function_runs_event_id ON public.function_runs(event_id)"),
-        ("idx_events_event_id", "CREATE INDEX IF NOT EXISTS idx_events_event_id ON public.events(event_id)"),
-        ("idx_history_event_id", "CREATE INDEX IF NOT EXISTS idx_history_event_id ON public.history(event_id)"),
+        ("idx_function_finishes_created_at", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_function_finishes_created_at ON public.function_finishes(created_at)"),
+        ("idx_function_runs_original_run_id", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_function_runs_original_run_id ON public.function_runs(original_run_id)"),
+        ("idx_history_run_id", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_history_run_id ON public.history(run_id)"),
+        ("idx_traces_run_id", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_traces_run_id ON public.traces(run_id)"),
+        ("idx_trace_runs_ended_at", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_trace_runs_ended_at ON public.trace_runs(ended_at)"),
+        ("idx_events_received_at", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_received_at ON public.events(received_at)"),
+        ("idx_events_internal_id_hash", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_internal_id_hash ON public.events USING hash(internal_id)"),
+        ("idx_function_runs_event_id", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_function_runs_event_id ON public.function_runs(event_id)"),
+        ("idx_events_event_id", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_event_id ON public.events(event_id)"),
+        ("idx_history_event_id", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_history_event_id ON public.history(event_id)"),
+
+        # Added indexes based on the list from PR: https://github.com/inngest/inngest/pull/2318
+        ("idx_function_runs_run_id", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_function_runs_run_id ON public.function_runs(run_id)"),
+        ("idx_function_runs_timebound", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_function_runs_timebound ON public.function_runs(run_started_at DESC, function_id)"),
+        ("idx_function_finishes_run_id", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_function_finishes_run_id ON public.function_finishes(run_id)"),
+        ("idx_events_received_name", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_received_name ON public.events(received_at, event_name)"),
+        ("idx_history_id", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_history_id ON public.history(id)"),
+        ("idx_history_run_id_created", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_history_run_id_created ON public.history(run_id, created_at ASC)"),
+        ("idx_traces_trace_id", "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_traces_trace_id ON public.traces(trace_id)"),
 
         # Index for event_batches to improve the POSITION lookup
-        # ("idx_event_batches_event_ids", "CREATEx INDEX IF NOT EXISTS idx_event_batches_event_ids ON public.event_batches USING gin (event_ids)")
+        # ("idx_event_batches_event_ids", "CREATEx INDEX CONCURRENTLY IF NOT EXISTS idx_event_batches_event_ids ON public.event_batches USING gin (event_ids)")
         
         # Add this index which is critical for the query
     ]
@@ -36,7 +45,7 @@ def create_indexes(conn):
     with conn.cursor() as cur:
         for index_name, index_sql in indexes:
             try:
-                logging.info("Creating index if not exists: %s", index_name)
+                logging.info("Creating index CONCURRENTLY if not exists: %s", index_name)
                 cur.execute(index_sql)
                 conn.commit()
             except psycopg2.errors.DuplicateTable:
