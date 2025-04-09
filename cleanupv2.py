@@ -42,19 +42,23 @@ def create_indexes(conn):
         # Add this index which is critical for the query
     ]
     
-    with conn.cursor() as cur:
-        for index_name, index_sql in indexes:
-            try:
-                logging.info("Creating index CONCURRENTLY if not exists: %s", index_name)
-                cur.execute(index_sql)
-                conn.commit()
-            except psycopg2.errors.DuplicateTable:
-                conn.rollback()
-                logging.info("Index %s already exists.", index_name)
-            except Exception as e:
-                conn.rollback()
-                logging.warning("Failed to create index %s: %s", index_name, str(e))
-    logging.info("Index creation complete.")
+    original_autocommit = conn.autocommit # Store original state
+    try:
+        conn.autocommit = True # Enable autocommit for index creation
+        with conn.cursor() as cur:
+            for index_name, index_sql in indexes:
+                try:
+                    logging.info("Attempting to create index CONCURRENTLY if not exists: %s", index_name)
+                    cur.execute(index_sql)
+                    # No commit needed in autocommit mode
+                except Exception as e:
+                    # Log errors, but don't attempt rollback (autocommit handles transactions implicitly)
+                    # Check e.pgcode or similar for specific errors if needed, e.g., lock timeouts
+                    logging.warning("Failed attempt to create or verify index %s: %s", index_name, str(e))
+    finally:
+        conn.autocommit = original_autocommit # ALWAYS restore original autocommit state
+        
+    logging.info("Index creation attempts complete.")
 
 def cleanup_function_data(conn, cutoff, batch_size=BATCH_SIZE):
     """
