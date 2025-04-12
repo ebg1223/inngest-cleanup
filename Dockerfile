@@ -44,5 +44,8 @@ HEALTHCHECK --interval=5m --timeout=3s --start-period=5s --retries=3 \
 COPY cleanupv2.py /app/
 RUN chmod +x /app/cleanupv2.py
 
+COPY cleanupv2-sqlite.py /app/
+RUN chmod +x /app/cleanupv2-sqlite.py
+
 # Use entrypoint script to set up dynamic cron schedule
 ENTRYPOINT ["/app/entrypoint.sh"]

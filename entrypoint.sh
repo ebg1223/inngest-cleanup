@@ -11,20 +11,20 @@ echo "CRON_SCHEDULE=$CRON_SCHEDULE"
 printenv > /app/env.sh
 
 # Use absolute paths for commands
-echo "${CRON_SCHEDULE} . /app/env.sh && /usr/local/bin/python /app/cleanupv2.py && date > /app/last_success" > /app/crontab
+echo "${CRON_SCHEDULE} . /app/env.sh && /usr/local/bin/python /app/cleanupv2-sqlite.py && date > /app/last_success" > /app/crontab
 
 # Print the crontab file for debugging
 echo "Contents of crontab file:"
 cat /app/crontab
 
 # Make sure script.py exists
-if [ ! -f /app/cleanupv2.py ]; then
-  echo "ERROR: /app/cleanupv2.py does not exist!"
+if [ ! -f /app/cleanupv2-sqlite.py ]; then
+  echo "ERROR: /app/cleanupv2-sqlite.py does not exist!"
   exit 1
 fi
 
 # Make sure script.py is executable
-chmod +x /app/cleanupv2.py
+chmod +x /app/cleanupv2-sqlite.py
 
 
 # Start supercronic with the generated crontab
