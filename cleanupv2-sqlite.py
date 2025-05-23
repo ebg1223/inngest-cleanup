@@ -76,25 +76,32 @@ def cleanup_function_data(conn, cutoff_iso, batch_size=BATCH_SIZE):
     double_cutoff_iso = double_cutoff_dt.isoformat()
     
     # Use ISO format string for timestamp comparison in SQLite assuming TEXT storage
-    # Adjust format or use Unix timestamp if stored differently
+    # Query combines two criteria:
+    # 1. Function finishes older than cutoff with no child runs within retention
+    # 2. Function runs directly where run_started_at is older than 2x retention
     find_sql = """
-        SELECT ff.run_id
-        FROM function_finishes ff
-        WHERE (
-            -- Original criteria: older than cutoff with no child runs within retention
-            (ff.created_at < ?
-             AND NOT EXISTS (
-                 SELECT 1
-                 FROM function_runs fr
-                 LEFT JOIN function_finishes ff2
-                   ON fr.run_id = ff2.run_id
-                 WHERE fr.original_run_id = ff.run_id
-                   AND (ff2.run_id IS NULL OR ff2.created_at >= ?)
-             ))
-            -- New criteria: any runs older than 2x retention period
-            OR ff.created_at < ?
+        SELECT DISTINCT run_id FROM (
+            -- Original criteria from function_finishes
+            SELECT ff.run_id
+            FROM function_finishes ff
+            WHERE ff.created_at < ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM function_runs fr
+                  LEFT JOIN function_finishes ff2
+                    ON fr.run_id = ff2.run_id
+                  WHERE fr.original_run_id = ff.run_id
+                    AND (ff2.run_id IS NULL OR ff2.created_at >= ?)
+              )
+            
+            UNION
+            
+            -- New criteria: query function_runs directly for 2x retention
+            SELECT fr.run_id
+            FROM function_runs fr
+            WHERE fr.run_started_at < ?
         )
-        ORDER BY ff.created_at ASC
+        ORDER BY run_id ASC
         LIMIT ?
     """
     try:
