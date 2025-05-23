@@ -70,27 +70,37 @@ def cleanup_function_data(conn, cutoff_iso, batch_size=BATCH_SIZE):
     Returns the number of candidate run_ids processed.
     """
     run_ids = []
+    # Calculate 2x retention cutoff
+    double_retention_hours = CLEANUP_RETENTION_HOURS * 2
+    double_cutoff_dt = datetime.now(UTC) - timedelta(hours=double_retention_hours)
+    double_cutoff_iso = double_cutoff_dt.isoformat()
+    
     # Use ISO format string for timestamp comparison in SQLite assuming TEXT storage
     # Adjust format or use Unix timestamp if stored differently
     find_sql = """
         SELECT ff.run_id
         FROM function_finishes ff
-        WHERE ff.created_at < ?
-          AND NOT EXISTS (
-              SELECT 1
-              FROM function_runs fr
-              LEFT JOIN function_finishes ff2
-                ON fr.run_id = ff2.run_id
-              WHERE fr.original_run_id = ff.run_id
-                AND (ff2.run_id IS NULL OR ff2.created_at >= ?)
-          )
+        WHERE (
+            -- Original criteria: older than cutoff with no child runs within retention
+            (ff.created_at < ?
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM function_runs fr
+                 LEFT JOIN function_finishes ff2
+                   ON fr.run_id = ff2.run_id
+                 WHERE fr.original_run_id = ff.run_id
+                   AND (ff2.run_id IS NULL OR ff2.created_at >= ?)
+             ))
+            -- New criteria: any runs older than 2x retention period
+            OR ff.created_at < ?
+        )
         ORDER BY ff.created_at ASC
         LIMIT ?
     """
     try:
         with conn:
             cur = conn.cursor()
-            cur.execute(adapt_identifier(find_sql), (cutoff_iso, cutoff_iso, batch_size))
+            cur.execute(adapt_identifier(find_sql), (cutoff_iso, cutoff_iso, double_cutoff_iso, batch_size))
             rows = cur.fetchall()
             run_ids = [row[0] for row in rows]
     except sqlite3.Error as e:
