@@ -418,7 +418,7 @@ class ImprovedInngestCleaner:
         try:
             if self.db_type == 'postgresql':
                 # Use a temporary table for better performance
-                cursor.execute("CREATE TEMP TABLE temp_referenced_events (event_id TEXT)")
+                cursor.execute("CREATE TEMP TABLE temp_referenced_events (event_id BYTEA)")
                 
                 # Insert referenced events in batches
                 if referenced_events:
@@ -427,7 +427,7 @@ class ImprovedInngestCleaner:
                     for i in range(0, len(ref_list), 1000):
                         batch = ref_list[i:i+1000]
                         cursor.executemany(
-                            "INSERT INTO temp_referenced_events VALUES (%s)",
+                            "INSERT INTO temp_referenced_events VALUES (%s::bytea)",
                             [(e,) for e in batch]
                         )
                 
@@ -506,12 +506,14 @@ class ImprovedInngestCleaner:
         try:
             # Find trace runs to delete based on ended_at
             if self.db_type == 'postgresql':
+                # Convert timestamp to milliseconds since ended_at is stored as bigint
+                cutoff_ms = int(self.cutoff_date.timestamp() * 1000)
                 cursor.execute("""
                     SELECT run_id FROM trace_runs
                     WHERE ended_at IS NOT NULL
                       AND ended_at < %s
                     LIMIT %s
-                """, (self.cutoff_date, self.batch_size))
+                """, (cutoff_ms, self.batch_size))
             else:
                 # For SQLite, handle milliseconds if that's how it's stored
                 cutoff_ms = int(self.cutoff_date.timestamp() * 1000)
