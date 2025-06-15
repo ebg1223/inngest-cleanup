@@ -14,8 +14,8 @@ echo "========================================="
 # Change to app directory
 cd /app
 
-# Run the cleanup script with virtual environment
-/app/.venv/bin/python /app/cleanup_inngest_env.py
+# Run the cleanup script
+python /app/cleanup_inngest_env.py
 
 # Log completion
 echo "Cleanup completed at $(date)"
