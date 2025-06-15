@@ -1,0 +1,15 @@
+[project]
+name = "inngest-cleanup"
+version = "1.0.0"
+description = "Database cleanup tool for self-hosted Inngest"
+requires-python = ">=3.9"
+dependencies = [
+    "psycopg2-binary>=2.9.0",
+]
+
+[tool.uv]
+dev-dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
