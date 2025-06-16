@@ -18,7 +18,7 @@ update_cron_schedule() {
 # Function to run cleanup immediately
 run_cleanup_now() {
     echo "Running cleanup immediately..."
-    su - inngest -c "cd /app && python /app/cleanup_inngest_env.py"
+    su - inngest -c "cd /app && /usr/local/bin/python /app/cleanup_inngest_env.py"
 }
 
 # Main entrypoint logic

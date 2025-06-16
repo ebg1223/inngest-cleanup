@@ -15,7 +15,7 @@ echo "========================================="
 cd /app
 
 # Run the cleanup script
-python /app/cleanup_inngest_env.py
+/usr/local/bin/python /app/cleanup_inngest_env.py
 
 # Log completion
 echo "Cleanup completed at $(date)"
