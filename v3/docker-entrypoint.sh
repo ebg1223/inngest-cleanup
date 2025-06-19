@@ -72,12 +72,22 @@ case "${1:-cron}" in
         python /app/test_redis_connection.py
         ;;
     
+    redis-scan|scan-redis)
+        echo "Scanning all Redis keys to find patterns"
+        if [ -z "$INNGEST_REDIS_URL" ]; then
+            echo "ERROR: INNGEST_REDIS_URL environment variable is required for Redis scan"
+            exit 1
+        fi
+        python /app/scan_redis_keys.py
+        ;;
+    
     *)
-        echo "Usage: $0 {cron|once|test|redis-check}"
+        echo "Usage: $0 {cron|once|test|redis-check|redis-scan}"
         echo "  cron: Run on schedule (default)"
         echo "  once: Run once and exit"
         echo "  test: Run once in dry-run mode"
         echo "  redis-check: Test Redis connection and show Inngest keys"
+        echo "  redis-scan: Scan all Redis keys to find patterns"
         exit 1
         ;;
 esac
