@@ -1,16 +1,13 @@
+# Dependencies for Inngest cleanup scripts
+# This file is used for documentation purposes
+# The Dockerfile installs dependencies directly
+
 [project]
 name = "inngest-cleanup"
 version = "1.1.0"
 description = "Database cleanup tool with Redis awareness for self-hosted Inngest"
 requires-python = ">=3.9"
-dependencies = [
-    "psycopg2-binary>=2.9.0",
-    "redis>=6.2.0",
-]
 
-[tool.uv]
-dev-dependencies = []
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+# Dependencies:
+# - psycopg2-binary>=2.9.0 (PostgreSQL support)
+# - redis>=6.2.0 (Redis state checking)

@@ -23,8 +23,8 @@ COPY cleanup_cron.sh docker-entrypoint.sh ./
 # Make scripts executable
 RUN chmod +x cleanup_cron.sh docker-entrypoint.sh
 
-# Install dependencies from pyproject.toml
-RUN uv pip install --system -e .
+# Install dependencies directly
+RUN uv pip install --system psycopg2-binary>=2.9.0 redis>=6.2.0
 
 # Change ownership of app directory
 RUN chown -R inngest:inngest /app
