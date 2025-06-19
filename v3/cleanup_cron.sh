@@ -14,14 +14,14 @@ echo "========================================="
 # Change to app directory
 cd /app
 
-# Run the cleanup script with virtual environment
+# Run the cleanup script
 # Check if Redis-aware cleanup is enabled
 if [ "$USE_REDIS_AWARE_CLEANUP" = "true" ] && [ -n "$INNGEST_REDIS_URL" ]; then
     echo "Running Redis-aware cleanup script"
-    /app/.venv/bin/python /app/cleanup_inngest_env_with_redis.py
+    python /app/cleanup_inngest_env_with_redis.py
 else
     echo "Running standard cleanup script"
-    /app/.venv/bin/python /app/cleanup_inngest_env.py
+    python /app/cleanup_inngest_env.py
 fi
 
 # Log completion

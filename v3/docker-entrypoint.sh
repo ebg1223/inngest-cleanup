@@ -20,10 +20,10 @@ run_cleanup_now() {
     echo "Running cleanup immediately..."
     if [ "$USE_REDIS_AWARE_CLEANUP" = "true" ] && [ -n "$INNGEST_REDIS_URL" ]; then
         echo "Using Redis-aware cleanup"
-        su - inngest -c "cd /app && /app/.venv/bin/python /app/cleanup_inngest_env_with_redis.py"
+        su - inngest -c "cd /app && python /app/cleanup_inngest_env_with_redis.py"
     else
         echo "Using standard cleanup"
-        su - inngest -c "cd /app && /app/.venv/bin/python /app/cleanup_inngest_env.py"
+        su - inngest -c "cd /app && python /app/cleanup_inngest_env.py"
     fi
 }
 
