@@ -11,13 +11,16 @@ import redis
 from datetime import datetime, timedelta
 from collections import defaultdict
 import json
+import binascii
 
 def decode_bytea(bytea_value):
-    """Convert bytea to string."""
+    """Convert bytea to hex string representation."""
+    if bytea_value is None:
+        return None
     if isinstance(bytea_value, memoryview):
-        return bytes(bytea_value).decode('utf-8')
+        return bytes(bytea_value).hex()
     elif isinstance(bytea_value, bytes):
-        return bytea_value.decode('utf-8')
+        return bytea_value.hex()
     return str(bytea_value)
 
 def run_diagnostics():
@@ -151,19 +154,37 @@ def run_diagnostics():
         
         print(f"Unique runs in Redis: {len(redis_runs):,}")
         
-        # Check how many exist in database
+        # Check how many exist in database - convert Redis run IDs to check
         if redis_runs:
             run_list = list(redis_runs)[:1000]  # Check first 1000
-            placeholders = ','.join(['%s::bytea' for _ in run_list])
-            cursor.execute(
-                f"SELECT COUNT(DISTINCT encode(run_id, 'escape')) FROM function_runs WHERE run_id IN ({placeholders})",
-                run_list
-            )
-            db_count = cursor.fetchone()[0]
-            orphaned = len(run_list) - db_count
+            
+            # Try to decode the Redis run IDs and match against bytea
+            existing_count = 0
+            for run_id in run_list:
+                try:
+                    # Try direct string comparison with encoded bytea
+                    cursor.execute(
+                        "SELECT 1 FROM function_runs WHERE encode(run_id, 'hex') = %s LIMIT 1",
+                        (run_id.lower(),)  # Lowercase for hex comparison
+                    )
+                    if cursor.fetchone():
+                        existing_count += 1
+                except:
+                    # If that fails, try the run_id as-is
+                    try:
+                        cursor.execute(
+                            "SELECT 1 FROM function_runs WHERE encode(run_id, 'escape') = %s LIMIT 1",
+                            (run_id,)
+                        )
+                        if cursor.fetchone():
+                            existing_count += 1
+                    except:
+                        pass
+            
+            orphaned = len(run_list) - existing_count
             
             print(f"  Checked {len(run_list)} Redis runs:")
-            print(f"  - {db_count} exist in database")
+            print(f"  - {existing_count} exist in database")
             print(f"  - {orphaned} orphaned in Redis")
         
         print()
@@ -205,7 +226,7 @@ def run_diagnostics():
         # Sample some incomplete runs to check Redis
         if incomplete_candidates > 0:
             cursor.execute("""
-                SELECT run_id
+                SELECT encode(run_id, 'hex')
                 FROM function_runs fr
                 WHERE fr.run_started_at < %s
                   AND NOT EXISTS (
@@ -218,11 +239,10 @@ def run_diagnostics():
             sample_runs = cursor.fetchall()
             active_count = 0
             
-            for (run_id_bytes,) in sample_runs:
-                run_id = decode_bytea(run_id_bytes)
+            for (run_id_hex,) in sample_runs:
                 # Check if active in Redis
-                if (r.exists(f"{{{redis_prefix}}}:pr:{run_id}") or 
-                    any(r.scan_iter(match=f"{{{redis_prefix}:*}}:metadata:{run_id}", count=1))):
+                if (r.exists(f"{{{redis_prefix}}}:pr:{run_id_hex}") or 
+                    any(r.scan_iter(match=f"{{{redis_prefix}:*}}:metadata:{run_id_hex}", count=1))):
                     active_count += 1
             
             if sample_runs:
@@ -268,6 +288,27 @@ def run_diagnostics():
         print("Column types:")
         for col_name, data_type in cursor.fetchall():
             print(f"  {col_name}: {data_type}")
+        
+        # 8. Sample Data
+        print("\n=== Sample Data ===")
+        
+        # Show sample run IDs in different formats
+        cursor.execute("""
+            SELECT 
+                run_id,
+                encode(run_id, 'hex') as hex,
+                encode(run_id, 'escape') as escape,
+                octet_length(run_id) as bytes
+            FROM function_runs 
+            LIMIT 3
+        """)
+        
+        print("Sample run_id formats:")
+        for run_id, hex_val, escape_val, byte_len in cursor.fetchall():
+            print(f"  Raw: {byte_len} bytes")
+            print(f"  Hex: {hex_val}")
+            print(f"  Escape: {escape_val}")
+            print()
         
         print("\n=== Diagnostics Complete ===")
         
