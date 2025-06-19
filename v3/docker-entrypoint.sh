@@ -81,13 +81,35 @@ case "${1:-cron}" in
         python /app/scan_redis_keys.py
         ;;
     
+    diagnose|diagnostic)
+        echo "Running comprehensive diagnostics"
+        validate_database_url
+        if [ -z "$INNGEST_REDIS_URL" ]; then
+            echo "ERROR: INNGEST_REDIS_URL environment variable is required for diagnostics"
+            exit 1
+        fi
+        python /app/diagnostic_check.py
+        ;;
+    
+    verify)
+        echo "Verifying cleanup behavior"
+        validate_database_url
+        if [ -z "$INNGEST_REDIS_URL" ]; then
+            echo "ERROR: INNGEST_REDIS_URL environment variable is required for verification"
+            exit 1
+        fi
+        python /app/verify_cleanup.py
+        ;;
+    
     *)
-        echo "Usage: $0 {cron|once|test|redis-check|redis-scan}"
+        echo "Usage: $0 {cron|once|test|redis-check|redis-scan|diagnose|verify}"
         echo "  cron: Run on schedule (default)"
         echo "  once: Run once and exit"
         echo "  test: Run once in dry-run mode"
         echo "  redis-check: Test Redis connection and show Inngest keys"
         echo "  redis-scan: Scan all Redis keys to find patterns"
+        echo "  diagnose: Run comprehensive diagnostics on PostgreSQL and Redis"
+        echo "  verify: Verify what cleanup would do and why"
         exit 1
         ;;
 esac

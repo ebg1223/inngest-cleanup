@@ -64,22 +64,62 @@ To test first:
 docker run -e INNGEST_DRY_RUN=true ... # See what would be deleted
 ```
 
-## Redis Connection Testing
+## Diagnostic Tools
 
-Test your Redis connection before running cleanup:
+### Redis Connection Testing
+
+Test your Redis connection and find Inngest keys:
+
+```bash
+# Basic Redis check
+docker run --rm \
+  -e INNGEST_REDIS_URL=redis://your-redis:6379 \
+  -e INNGEST_REDIS_KEY_PREFIX=estate \
+  ghcr.io/your-org/inngest-cleaner:latest redis-check
+
+# Scan all Redis keys to find patterns
+docker run --rm \
+  -e INNGEST_REDIS_URL=redis://your-redis:6379 \
+  ghcr.io/your-org/inngest-cleaner:latest redis-scan
+```
+
+### Comprehensive Diagnostics
+
+Run full diagnostics on PostgreSQL and Redis data:
 
 ```bash
 docker run --rm \
+  -e INNGEST_DATABASE_URL=postgresql://... \
   -e INNGEST_REDIS_URL=redis://your-redis:6379 \
-  -e INNGEST_REDIS_KEY_PREFIX=inngest \
-  ghcr.io/your-org/inngest-cleaner:latest redis-check
+  -e INNGEST_REDIS_KEY_PREFIX=estate \
+  ghcr.io/your-org/inngest-cleaner:latest diagnose
 ```
 
-This will show:
-- Redis connection status
-- Number of Inngest keys found
-- Sample key names
-- Redis server info
+Shows:
+- Database record counts and age distribution
+- Redis key counts by type
+- Data consistency analysis
+- Cleanup candidates
+- Column type information
+
+### Verify Cleanup Behavior
+
+See exactly what would be cleaned and why:
+
+```bash
+docker run --rm \
+  -e INNGEST_DATABASE_URL=postgresql://... \
+  -e INNGEST_REDIS_URL=redis://your-redis:6379 \
+  -e INNGEST_REDIS_KEY_PREFIX=estate \
+  -e INNGEST_RETENTION_DAYS=3 \
+  ghcr.io/your-org/inngest-cleaner:latest verify
+```
+
+Shows:
+- Sample runs that would be deleted
+- Why each run would be kept or deleted
+- Redis state for incomplete runs
+- Potential issues detected
 
 ## Troubleshooting
 
