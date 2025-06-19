@@ -21,6 +21,7 @@ COPY pyproject.toml cleanup_inngest_env.py cleanup_inngest_env_with_redis.py ./
 COPY cleanup_cron.sh docker-entrypoint.sh ./
 COPY test_redis_connection.py scan_redis_keys.py ./
 COPY diagnostic_check.py verify_cleanup.py ./
+COPY debug_redis_pg_match.py ./
 
 # Make scripts executable
 RUN chmod +x cleanup_cron.sh docker-entrypoint.sh test_redis_connection.py

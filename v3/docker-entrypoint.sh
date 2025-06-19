@@ -101,8 +101,18 @@ case "${1:-cron}" in
         python /app/verify_cleanup.py
         ;;
     
+    debug-match|debug)
+        echo "Debugging Redis to PostgreSQL matching"
+        validate_database_url
+        if [ -z "$INNGEST_REDIS_URL" ]; then
+            echo "ERROR: INNGEST_REDIS_URL environment variable is required for debugging"
+            exit 1
+        fi
+        python /app/debug_redis_pg_match.py
+        ;;
+    
     *)
-        echo "Usage: $0 {cron|once|test|redis-check|redis-scan|diagnose|verify}"
+        echo "Usage: $0 {cron|once|test|redis-check|redis-scan|diagnose|verify|debug-match}"
         echo "  cron: Run on schedule (default)"
         echo "  once: Run once and exit"
         echo "  test: Run once in dry-run mode"
@@ -110,6 +120,7 @@ case "${1:-cron}" in
         echo "  redis-scan: Scan all Redis keys to find patterns"
         echo "  diagnose: Run comprehensive diagnostics on PostgreSQL and Redis"
         echo "  verify: Verify what cleanup would do and why"
+        echo "  debug-match: Debug Redis to PostgreSQL run ID matching"
         exit 1
         ;;
 esac
