@@ -9,6 +9,29 @@ import psycopg2
 import redis
 from datetime import datetime, timedelta
 
+# ULID conversion utilities
+def ulid_to_bytes(ulid_str):
+    """Convert a ULID string to bytes for PostgreSQL bytea comparison."""
+    ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    ulid_str = ulid_str.upper()
+    value = 0
+    for char in ulid_str:
+        value = value * 32 + ALPHABET.index(char)
+    return value.to_bytes(16, byteorder='big')
+
+def hex_to_ulid(hex_str):
+    """Convert hex string to ULID for Redis lookups."""
+    ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    value = int(hex_str, 16)
+    if value == 0:
+        return ALPHABET[0] * 26
+    chars = []
+    while value > 0 and len(chars) < 26:
+        chars.append(ALPHABET[value % 32])
+        value //= 32
+    result = ''.join(reversed(chars))
+    return ALPHABET[0] * (26 - len(result)) + result
+
 def decode_bytea(bytea_value):
     """Convert bytea to hex string representation."""
     if bytea_value is None:
@@ -104,17 +127,17 @@ def verify_cleanup():
             for run_id_hex, started_at, func_id in incomplete:
                 age_days = (datetime.now() - started_at).days
                 
-                # Check Redis state using hex representation
-                has_pauses = r.exists(f"{{{redis_prefix}}}:pr:{run_id_hex}")
-                has_metadata = any(r.scan_iter(match=f"{{{redis_prefix}:*}}:metadata:{run_id_hex}", count=1))
-                has_stack = any(r.scan_iter(match=f"{{{redis_prefix}:*}}:stack:{run_id_hex}", count=1))
+                # Convert hex to ULID for Redis lookup
+                try:
+                    run_id_ulid = hex_to_ulid(run_id_hex)
+                except Exception as e:
+                    print(f"Error converting {run_id_hex} to ULID: {e}")
+                    run_id_ulid = run_id_hex  # Fallback to hex
                 
-                # Also try uppercase hex
-                if not (has_pauses or has_metadata or has_stack):
-                    run_id_upper = run_id_hex.upper()
-                    has_pauses = r.exists(f"{{{redis_prefix}}}:pr:{run_id_upper}")
-                    has_metadata = any(r.scan_iter(match=f"{{{redis_prefix}:*}}:metadata:{run_id_upper}", count=1))
-                    has_stack = any(r.scan_iter(match=f"{{{redis_prefix}:*}}:stack:{run_id_upper}", count=1))
+                # Check Redis state using ULID representation
+                has_pauses = r.exists(f"{{{redis_prefix}}}:pr:{run_id_ulid}")
+                has_metadata = any(r.scan_iter(match=f"{{{redis_prefix}:*}}:metadata:{run_id_ulid}", count=1))
+                has_stack = any(r.scan_iter(match=f"{{{redis_prefix}:*}}:stack:{run_id_ulid}", count=1))
                 
                 has_redis_state = has_pauses or has_metadata or has_stack
                 

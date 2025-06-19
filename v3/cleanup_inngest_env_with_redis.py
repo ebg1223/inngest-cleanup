@@ -16,6 +16,44 @@ import redis
 from urllib.parse import urlparse
 import json
 
+# ULID conversion utilities
+def ulid_to_bytes(ulid_str):
+    """Convert a ULID string to bytes for PostgreSQL bytea comparison."""
+    # Crockford's Base32 alphabet (excludes I, L, O, U to avoid confusion)
+    ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    
+    # Convert to uppercase for consistency
+    ulid_str = ulid_str.upper()
+    
+    # Convert base32 to integer
+    value = 0
+    for char in ulid_str:
+        value = value * 32 + ALPHABET.index(char)
+    
+    # Convert to 16 bytes (128 bits)
+    return value.to_bytes(16, byteorder='big')
+
+def hex_to_ulid(hex_str):
+    """Convert hex string to ULID for Redis lookups."""
+    # Crockford's Base32 alphabet
+    ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    
+    # Convert hex to integer
+    value = int(hex_str, 16)
+    
+    # Convert to base32
+    if value == 0:
+        return ALPHABET[0] * 26
+    
+    chars = []
+    while value > 0 and len(chars) < 26:
+        chars.append(ALPHABET[value % 32])
+        value //= 32
+    
+    # Pad with zeros if needed and reverse
+    result = ''.join(reversed(chars))
+    return ALPHABET[0] * (26 - len(result)) + result
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -125,13 +163,17 @@ class RedisAwareInngestCleaner:
         return text_value.encode('utf-8')
     
     def _decode_from_bytea(self, bytea_value) -> str:
-        """Convert bytea to text format."""
+        """Convert bytea to ULID format for Redis lookups."""
         if isinstance(bytea_value, memoryview):
-            return bytes(bytea_value).decode('utf-8')
+            hex_str = bytes(bytea_value).hex()
         elif isinstance(bytea_value, bytes):
-            return bytea_value.decode('utf-8')
+            hex_str = bytea_value.hex()
         else:
+            # Assume it's already a string
             return str(bytea_value)
+        
+        # Convert hex to ULID for Redis lookups
+        return hex_to_ulid(hex_str)
     
     def check_run_active_in_redis(self, run_id: str) -> bool:
         """Check if a run has any active state in Redis."""
@@ -355,20 +397,36 @@ class RedisAwareInngestCleaner:
                 cursor = self.connection.cursor()
                 try:
                     if self.db_type == 'postgresql':
-                        # Convert string run IDs to bytea for comparison
-                        run_id_list = list(redis_run_ids)
-                        placeholders = ','.join(['%s::bytea' for _ in run_id_list])
-                        query = f"SELECT encode(run_id, 'escape') FROM function_runs WHERE run_id IN ({placeholders})"
-                        cursor.execute(query, run_id_list)
+                        # Convert ULID strings to bytea format for PostgreSQL comparison
+                        existing_ulids = set()
+                        
+                        # Check each Redis ULID against the database
+                        for ulid in redis_run_ids:
+                            try:
+                                # Convert ULID to hex for PostgreSQL query
+                                ulid_bytes = ulid_to_bytes(ulid)
+                                ulid_hex = ulid_bytes.hex()
+                                
+                                cursor.execute(
+                                    "SELECT 1 FROM function_runs WHERE encode(run_id, 'hex') = %s LIMIT 1",
+                                    (ulid_hex,)
+                                )
+                                if cursor.fetchone():
+                                    existing_ulids.add(ulid)
+                            except Exception as e:
+                                logger.debug(f"Error checking ULID {ulid}: {e}")
+                                # Assume it exists to be safe
+                                existing_ulids.add(ulid)
+                        
+                        orphaned_runs = redis_run_ids - existing_ulids
                     else:
                         placeholders = ','.join(['?' for _ in redis_run_ids])
                         cursor.execute(
                             f"SELECT run_id FROM function_runs WHERE run_id IN ({placeholders})",
                             list(redis_run_ids)
                         )
-                    
-                    existing_runs = {row[0] for row in cursor.fetchall()}
-                    orphaned_runs = redis_run_ids - existing_runs
+                        existing_runs = {row[0] for row in cursor.fetchall()}
+                        orphaned_runs = redis_run_ids - existing_runs
                     
                     if orphaned_runs:
                         logger.info(f"Found {len(orphaned_runs)} orphaned runs in Redis")

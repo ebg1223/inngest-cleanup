@@ -13,6 +13,29 @@ from collections import defaultdict
 import json
 import binascii
 
+# ULID conversion utilities
+def ulid_to_bytes(ulid_str):
+    """Convert a ULID string to bytes for PostgreSQL bytea comparison."""
+    ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    ulid_str = ulid_str.upper()
+    value = 0
+    for char in ulid_str:
+        value = value * 32 + ALPHABET.index(char)
+    return value.to_bytes(16, byteorder='big')
+
+def hex_to_ulid(hex_str):
+    """Convert hex string to ULID for Redis lookups."""
+    ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    value = int(hex_str, 16)
+    if value == 0:
+        return ALPHABET[0] * 26
+    chars = []
+    while value > 0 and len(chars) < 26:
+        chars.append(ALPHABET[value % 32])
+        value //= 32
+    result = ''.join(reversed(chars))
+    return ALPHABET[0] * (26 - len(result)) + result
+
 def decode_bytea(bytea_value):
     """Convert bytea to hex string representation."""
     if bytea_value is None:
@@ -158,28 +181,24 @@ def run_diagnostics():
         if redis_runs:
             run_list = list(redis_runs)[:1000]  # Check first 1000
             
-            # Try to decode the Redis run IDs and match against bytea
+            # Convert ULID strings to bytea format for PostgreSQL comparison
             existing_count = 0
-            for run_id in run_list:
+            for ulid in run_list:
                 try:
-                    # Try direct string comparison with encoded bytea
+                    # Convert ULID to hex for PostgreSQL query
+                    ulid_bytes = ulid_to_bytes(ulid)
+                    ulid_hex = ulid_bytes.hex()
+                    
                     cursor.execute(
                         "SELECT 1 FROM function_runs WHERE encode(run_id, 'hex') = %s LIMIT 1",
-                        (run_id.lower(),)  # Lowercase for hex comparison
+                        (ulid_hex,)
                     )
                     if cursor.fetchone():
                         existing_count += 1
-                except:
-                    # If that fails, try the run_id as-is
-                    try:
-                        cursor.execute(
-                            "SELECT 1 FROM function_runs WHERE encode(run_id, 'escape') = %s LIMIT 1",
-                            (run_id,)
-                        )
-                        if cursor.fetchone():
-                            existing_count += 1
-                    except:
-                        pass
+                except Exception as e:
+                    # Log the error but continue
+                    print(f"  Error checking ULID {ulid}: {e}")
+                    pass
             
             orphaned = len(run_list) - existing_count
             
