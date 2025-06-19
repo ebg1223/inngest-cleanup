@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-Inngest Database Cleanup Script with Redis Awareness - Environment Variable Version
+Inngest Database Cleanup Script with Redis Awareness - PostgreSQL Type Fix
 
-This version checks Redis state before deleting database records to prevent
-cleaning up active function runs, pauses, or other in-flight operations.
-
-FIXED VERSION: Corrected Redis key patterns based on actual Inngest deployment.
+This version handles PostgreSQL bytea types and bigint timestamps correctly.
 """
 
 import logging
@@ -57,11 +54,9 @@ class RedisAwareInngestCleaner:
         self.double_cutoff_date = datetime.now() - timedelta(days=retention_days * double_retention_multiplier)
         
         # Redis key patterns based on ACTUAL Inngest deployment
-        # Fixed: Removed :state suffix based on real Redis scan
         self.redis_patterns = {
             'pauses': f"{{{redis_key_prefix}}}:pauses:*",
             'pause_runs': f"{{{redis_key_prefix}}}:pr:*",
-            # Workspace-specific patterns (we'll need to check these dynamically)
             'metadata': f"{{{redis_key_prefix}:*}}:metadata:*",
             'stack': f"{{{redis_key_prefix}:*}}:stack:*",
             'actions': f"{{{redis_key_prefix}:*}}:actions:*",
@@ -91,6 +86,8 @@ class RedisAwareInngestCleaner:
         # Database connection
         if self.db_type == 'postgresql':
             self.connection = psycopg2.connect(self.database_url)
+            # Register bytea adapter to handle conversions
+            psycopg2.extensions.register_type(psycopg2.extensions.UNICODE)
         else:
             # Handle SQLite URL format
             if self.database_url.startswith('sqlite:///'):
@@ -123,6 +120,19 @@ class RedisAwareInngestCleaner:
             self.redis_client.close()
             logger.info("Redis connection closed")
     
+    def _encode_to_bytea(self, text_value: str) -> bytes:
+        """Convert text to bytea format for PostgreSQL."""
+        return text_value.encode('utf-8')
+    
+    def _decode_from_bytea(self, bytea_value) -> str:
+        """Convert bytea to text format."""
+        if isinstance(bytea_value, memoryview):
+            return bytes(bytea_value).decode('utf-8')
+        elif isinstance(bytea_value, bytes):
+            return bytea_value.decode('utf-8')
+        else:
+            return str(bytea_value)
+    
     def check_run_active_in_redis(self, run_id: str) -> bool:
         """Check if a run has any active state in Redis."""
         if not self.redis_client:
@@ -136,8 +146,6 @@ class RedisAwareInngestCleaner:
                 return True
             
             # Check for workspace-specific metadata
-            # Since we don't know the workspace ID, we need to scan
-            # This is less efficient but necessary for accurate checking
             pattern = f"{{{self.redis_key_prefix}:*}}:metadata:{run_id}"
             for key in self.redis_client.scan_iter(match=pattern, count=10):
                 if key:
@@ -183,26 +191,35 @@ class RedisAwareInngestCleaner:
             # Be conservative
             return True
     
-    def filter_safe_to_delete_incomplete_runs(self, run_ids: List[str]) -> List[str]:
+    def filter_safe_to_delete_incomplete_runs(self, run_ids: List[Tuple]) -> List[bytes]:
         """Filter incomplete run IDs to only include those with no active Redis state (abandoned)."""
         if not run_ids:
             return []
         
         safe_run_ids = []
         
-        for run_id in run_ids:
+        for run_data in run_ids:
+            # Extract run_id (might be tuple from fetchall)
+            if isinstance(run_data, tuple):
+                run_id_bytes = run_data[0]
+            else:
+                run_id_bytes = run_data
+            
+            # Convert bytea to string for Redis lookup
+            run_id_str = self._decode_from_bytea(run_id_bytes)
+            
             # For incomplete runs, presence of Redis state means it's still active
-            if self.check_run_active_in_redis(run_id) or self.check_run_has_active_pauses(run_id):
-                logger.debug(f"Skipping incomplete run {run_id} - has active Redis state")
+            if self.check_run_active_in_redis(run_id_str) or self.check_run_has_active_pauses(run_id_str):
+                logger.debug(f"Skipping incomplete run {run_id_str} - has active Redis state")
                 continue
             
             # No Redis state for an incomplete run means it's abandoned
-            safe_run_ids.append(run_id)
+            safe_run_ids.append(run_id_bytes)
         
         logger.info(f"Filtered {len(run_ids)} incomplete runs to {len(safe_run_ids)} abandoned runs safe to delete")
         return safe_run_ids
     
-    def get_function_runs_to_delete(self) -> List[str]:
+    def get_function_runs_to_delete(self) -> List[bytes]:
         """
         Get function run IDs to delete using improved logic:
         1. Completed runs (with function_finishes) older than cutoff - these are safe to delete
@@ -247,9 +264,9 @@ class RedisAwareInngestCleaner:
                         LIMIT %s
                     """
                     cursor.execute(incomplete_query, (self.double_cutoff_date, self.batch_size - len(completed_runs)))
-                    incomplete_runs = [row[0] for row in cursor.fetchall()]
+                    incomplete_runs = cursor.fetchall()
             else:
-                # SQLite version
+                # SQLite version (unchanged)
                 completed_query = """
                     SELECT ff.run_id
                     FROM function_finishes ff
@@ -280,7 +297,7 @@ class RedisAwareInngestCleaner:
                         LIMIT ?
                     """
                     cursor.execute(incomplete_query, (self.double_cutoff_date, self.batch_size - len(completed_runs)))
-                    incomplete_runs = [row[0] for row in cursor.fetchall()]
+                    incomplete_runs = cursor.fetchall()
             
             # Completed runs are safe to delete (Redis state already cleaned by Inngest)
             safe_run_ids = completed_runs
@@ -295,6 +312,7 @@ class RedisAwareInngestCleaner:
             
         except Exception as e:
             logger.error(f"Error finding function runs to delete: {e}")
+            raise
         finally:
             cursor.close()
         
@@ -337,10 +355,11 @@ class RedisAwareInngestCleaner:
                 cursor = self.connection.cursor()
                 try:
                     if self.db_type == 'postgresql':
-                        cursor.execute(
-                            "SELECT run_id FROM function_runs WHERE run_id = ANY(%s)",
-                            (list(redis_run_ids),)
-                        )
+                        # Convert string run IDs to bytea for comparison
+                        run_id_list = list(redis_run_ids)
+                        placeholders = ','.join(['%s::bytea' for _ in run_id_list])
+                        query = f"SELECT encode(run_id, 'escape') FROM function_runs WHERE run_id IN ({placeholders})"
+                        cursor.execute(query, run_id_list)
                     else:
                         placeholders = ','.join(['?' for _ in redis_run_ids])
                         cursor.execute(
@@ -377,8 +396,6 @@ class RedisAwareInngestCleaner:
             logger.error(f"Error cleaning orphaned Redis state: {e}")
         
         return stats
-    
-    # ... rest of the methods remain the same ...
     
     def clean_function_data(self) -> Dict[str, int]:
         """Clean function-related data with Redis awareness."""
@@ -535,7 +552,7 @@ class RedisAwareInngestCleaner:
         
         return run_ids
     
-    def get_referenced_event_ids(self, cutoff: datetime) -> Set[str]:
+    def get_referenced_event_ids(self, cutoff: datetime) -> Set[bytes]:
         """Get all event IDs that are still referenced by function runs or history."""
         cursor = self.connection.cursor()
         event_ids = set()
@@ -584,7 +601,7 @@ class RedisAwareInngestCleaner:
             logger.info("[DRY RUN] Would clean events")
             return 0
         
-        # Get referenced event IDs
+        # Get referenced event IDs (returns bytea for PostgreSQL)
         referenced_events = self.get_referenced_event_ids(self.cutoff_date)
         
         cursor = self.connection.cursor()
@@ -593,7 +610,7 @@ class RedisAwareInngestCleaner:
         try:
             if self.db_type == 'postgresql':
                 # Use a temporary table for better performance
-                cursor.execute("CREATE TEMP TABLE temp_referenced_events (event_id TEXT)")
+                cursor.execute("CREATE TEMP TABLE temp_referenced_events (event_id BYTEA)")
                 
                 # Insert referenced events in batches
                 if referenced_events:
@@ -681,12 +698,14 @@ class RedisAwareInngestCleaner:
         try:
             # Find trace runs to delete based on ended_at
             if self.db_type == 'postgresql':
+                # Convert timestamp to milliseconds for comparison with bigint
+                cutoff_ms = int(self.cutoff_date.timestamp() * 1000)
                 cursor.execute("""
                     SELECT run_id FROM trace_runs
                     WHERE ended_at IS NOT NULL
                       AND ended_at < %s
                     LIMIT %s
-                """, (self.cutoff_date, self.batch_size))
+                """, (cutoff_ms, self.batch_size))
             else:
                 # For SQLite, handle milliseconds if that's how it's stored
                 cutoff_ms = int(self.cutoff_date.timestamp() * 1000)
