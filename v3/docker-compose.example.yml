@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  inngest-cleanup:
+    build: .
+    # Or use the published image:
+    # image: ghcr.io/your-org/inngest-cleaner:latest
+    
+    environment:
+      # Required: Database connection
+      INNGEST_DATABASE_URL: postgresql://user:password@postgres:5432/inngest
+      
+      # Required for Redis-aware cleanup: Redis connection
+      INNGEST_REDIS_URL: redis://redis:6379
+      
+      # Optional: Retention settings
+      INNGEST_RETENTION_DAYS: 30
+      INNGEST_DOUBLE_RETENTION: 2.0
+      
+      # Optional: Redis configuration
+      USE_REDIS_AWARE_CLEANUP: "true"
+      INNGEST_REDIS_KEY_PREFIX: "inngest"
+      
+      # Optional: Batch processing
+      INNGEST_BATCH_SIZE: 1000
+      
+      # Optional: Schedule (cron format)
+      CLEANUP_SCHEDULE: "0 2 * * *"  # 2 AM daily
+      
+      # Optional: Dry run mode for testing
+      INNGEST_DRY_RUN: "false"
+    
+    # For SQLite, mount the database file
+    # volumes:
+    #   - /path/to/inngest.db:/data/inngest.db
+    
+    # Connect to the same network as your Inngest services
+    networks:
+      - inngest-network
+    
+    # Run modes:
+    # - Default: Run on schedule (cron)
+    # - "once": Run once and exit
+    # - "test": Dry run once and exit
+    command: cron
+    
+    restart: unless-stopped
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+# Example network configuration
+networks:
+  inngest-network:
+    external: true
+
+# Example with all services together
+# services:
+#   postgres:
+#     image: postgres:15
+#     environment:
+#       POSTGRES_DB: inngest
+#       POSTGRES_USER: user
+#       POSTGRES_PASSWORD: password
+#     networks:
+#       - inngest-network
+#   
+#   redis:
+#     image: redis:7
+#     networks:
+#       - inngest-network
+#   
+#   inngest-cleanup:
+#     # ... configuration above ...
