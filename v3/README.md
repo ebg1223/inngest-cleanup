@@ -64,9 +64,27 @@ To test first:
 docker run -e INNGEST_DRY_RUN=true ... # See what would be deleted
 ```
 
+## Redis Connection Testing
+
+Test your Redis connection before running cleanup:
+
+```bash
+docker run --rm \
+  -e INNGEST_REDIS_URL=redis://your-redis:6379 \
+  -e INNGEST_REDIS_KEY_PREFIX=inngest \
+  ghcr.io/your-org/inngest-cleaner:latest redis-check
+```
+
+This will show:
+- Redis connection status
+- Number of Inngest keys found
+- Sample key names
+- Redis server info
+
 ## Troubleshooting
 
 ### Still getting "run not found" errors?
+- Run `redis-check` to verify connection: `docker run ... redis-check`
 - Verify `INNGEST_REDIS_URL` is correct
 - Check `INNGEST_REDIS_KEY_PREFIX` matches your Inngest setup
 - Ensure cleanup container can reach Redis

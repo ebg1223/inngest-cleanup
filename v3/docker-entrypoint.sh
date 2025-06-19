@@ -63,11 +63,21 @@ case "${1:-cron}" in
         run_cleanup_now
         ;;
     
+    redis-check|check-redis)
+        echo "Checking Redis connection and Inngest keys"
+        if [ -z "$INNGEST_REDIS_URL" ]; then
+            echo "ERROR: INNGEST_REDIS_URL environment variable is required for Redis check"
+            exit 1
+        fi
+        python /app/test_redis_connection.py
+        ;;
+    
     *)
-        echo "Usage: $0 {cron|once|test}"
+        echo "Usage: $0 {cron|once|test|redis-check}"
         echo "  cron: Run on schedule (default)"
         echo "  once: Run once and exit"
         echo "  test: Run once in dry-run mode"
+        echo "  redis-check: Test Redis connection and show Inngest keys"
         exit 1
         ;;
 esac

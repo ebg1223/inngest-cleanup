@@ -19,9 +19,10 @@ WORKDIR /app
 # Copy project files
 COPY pyproject.toml cleanup_inngest_env.py cleanup_inngest_env_with_redis.py ./
 COPY cleanup_cron.sh docker-entrypoint.sh ./
+COPY test_redis_connection.py ./
 
 # Make scripts executable
-RUN chmod +x cleanup_cron.sh docker-entrypoint.sh
+RUN chmod +x cleanup_cron.sh docker-entrypoint.sh test_redis_connection.py
 
 # Install dependencies directly
 RUN uv pip install --system psycopg2-binary>=2.9.0 redis>=6.2.0
