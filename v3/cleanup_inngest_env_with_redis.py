@@ -4,6 +4,8 @@ Inngest Database Cleanup Script with Redis Awareness - Environment Variable Vers
 
 This version checks Redis state before deleting database records to prevent
 cleaning up active function runs, pauses, or other in-flight operations.
+
+FIXED VERSION: Corrected Redis key patterns based on actual Inngest deployment.
 """
 
 import logging
@@ -54,16 +56,16 @@ class RedisAwareInngestCleaner:
         self.cutoff_date = datetime.now() - timedelta(days=retention_days)
         self.double_cutoff_date = datetime.now() - timedelta(days=retention_days * double_retention_multiplier)
         
-        # Redis key patterns based on Inngest codebase analysis
+        # Redis key patterns based on ACTUAL Inngest deployment
+        # Fixed: Removed :state suffix based on real Redis scan
         self.redis_patterns = {
-            'metadata': f"{{{redis_key_prefix}:state}}:metadata:*",
-            'actions': f"{{{redis_key_prefix}:state}}:actions:*",
-            'events': f"{{{redis_key_prefix}:state}}:events:*",
-            'stack': f"{{{redis_key_prefix}:state}}:stack:*",
-            'pauses': f"{{{redis_key_prefix}:state}}:pauses:*",
-            'pause_runs': f"{{{redis_key_prefix}:state}}:pr:*",
-            'invoke': f"{{{redis_key_prefix}:state}}:invoke:*",
-            'signal': f"{{{redis_key_prefix}:state}}:signal:*"
+            'pauses': f"{{{redis_key_prefix}}}:pauses:*",
+            'pause_runs': f"{{{redis_key_prefix}}}:pr:*",
+            # Workspace-specific patterns (we'll need to check these dynamically)
+            'metadata': f"{{{redis_key_prefix}:*}}:metadata:*",
+            'stack': f"{{{redis_key_prefix}:*}}:stack:*",
+            'actions': f"{{{redis_key_prefix}:*}}:actions:*",
+            'events': f"{{{redis_key_prefix}:*}}:events:*",
         }
         
         logger.info(f"Database type: {self.db_type}")
@@ -72,6 +74,7 @@ class RedisAwareInngestCleaner:
         logger.info(f"Extended retention: {retention_days * double_retention_multiplier} days (cutoff: {self.double_cutoff_date})")
         logger.info(f"Batch size: {batch_size}")
         logger.info(f"Dry run: {dry_run}")
+        logger.info(f"Redis key prefix: {redis_key_prefix}")
     
     def _determine_db_type(self, url: str) -> str:
         """Determine if the database is PostgreSQL or SQLite."""
@@ -126,23 +129,27 @@ class RedisAwareInngestCleaner:
             return False
         
         try:
-            # Check for metadata (most basic check)
-            metadata_key = f"{{{self.redis_key_prefix}:state}}:metadata:{run_id}"
-            if self.redis_client.exists(metadata_key):
-                logger.debug(f"Run {run_id} has active metadata in Redis")
-                return True
-            
-            # Check for stack state
-            stack_key = f"{{{self.redis_key_prefix}:state}}:stack:{run_id}"
-            if self.redis_client.exists(stack_key):
-                logger.debug(f"Run {run_id} has active stack in Redis")
-                return True
-            
-            # Check for pause references
-            pause_run_key = f"{{{self.redis_key_prefix}:state}}:pr:{run_id}"
+            # Check global pause-run mapping first (most reliable)
+            pause_run_key = f"{{{self.redis_key_prefix}}}:pr:{run_id}"
             if self.redis_client.exists(pause_run_key):
                 logger.debug(f"Run {run_id} has active pauses in Redis")
                 return True
+            
+            # Check for workspace-specific metadata
+            # Since we don't know the workspace ID, we need to scan
+            # This is less efficient but necessary for accurate checking
+            pattern = f"{{{self.redis_key_prefix}:*}}:metadata:{run_id}"
+            for key in self.redis_client.scan_iter(match=pattern, count=10):
+                if key:
+                    logger.debug(f"Run {run_id} has active metadata in Redis: {key}")
+                    return True
+            
+            # Check for workspace-specific stack
+            pattern = f"{{{self.redis_key_prefix}:*}}:stack:{run_id}"
+            for key in self.redis_client.scan_iter(match=pattern, count=10):
+                if key:
+                    logger.debug(f"Run {run_id} has active stack in Redis: {key}")
+                    return True
             
             return False
             
@@ -158,13 +165,13 @@ class RedisAwareInngestCleaner:
         
         try:
             # Check pause-run mapping
-            pause_run_key = f"{{{self.redis_key_prefix}:state}}:pr:{run_id}"
+            pause_run_key = f"{{{self.redis_key_prefix}}}:pr:{run_id}"
             pause_ids = self.redis_client.smembers(pause_run_key)
             
             if pause_ids:
                 # Verify at least one pause still exists
                 for pause_id in pause_ids:
-                    pause_key = f"{{{self.redis_key_prefix}:state}}:pauses:{pause_id}"
+                    pause_key = f"{{{self.redis_key_prefix}}}:pauses:{pause_id}"
                     if self.redis_client.exists(pause_key):
                         logger.debug(f"Run {run_id} has active pause {pause_id}")
                         return True
@@ -313,8 +320,13 @@ class RedisAwareInngestCleaner:
             # Find run IDs in Redis
             redis_run_ids = set()
             
-            # Scan for metadata keys
-            for key in self.redis_client.scan_iter(match=f"{{{self.redis_key_prefix}:state}}:metadata:*", count=100):
+            # Scan for pause-run mappings (global)
+            for key in self.redis_client.scan_iter(match=f"{{{self.redis_key_prefix}}}:pr:*", count=100):
+                run_id = key.split(':')[-1]
+                redis_run_ids.add(run_id)
+            
+            # Scan for workspace-specific metadata
+            for key in self.redis_client.scan_iter(match=f"{{{self.redis_key_prefix}:*}}:metadata:*", count=100):
                 run_id = key.split(':')[-1]
                 redis_run_ids.add(run_id)
             
@@ -344,23 +356,19 @@ class RedisAwareInngestCleaner:
                         
                         # Clean orphaned Redis state
                         for run_id in orphaned_runs:
-                            # Delete metadata
-                            if self.redis_client.delete(f"{{{self.redis_key_prefix}:state}}:metadata:{run_id}"):
-                                stats['redis_metadata'] += 1
-                            
-                            # Delete stack
-                            if self.redis_client.delete(f"{{{self.redis_key_prefix}:state}}:stack:{run_id}"):
-                                stats['redis_stack'] += 1
-                            
-                            # Delete pause references
-                            if self.redis_client.delete(f"{{{self.redis_key_prefix}:state}}:pr:{run_id}"):
+                            # Delete pause-run mapping
+                            if self.redis_client.delete(f"{{{self.redis_key_prefix}}}:pr:{run_id}"):
                                 stats['redis_pauses'] += 1
                             
-                            # Also clean action and event keys
-                            for key in self.redis_client.scan_iter(match=f"{{{self.redis_key_prefix}:state}}:actions:*:{run_id}", count=10):
-                                self.redis_client.delete(key)
-                            for key in self.redis_client.scan_iter(match=f"{{{self.redis_key_prefix}:state}}:events:*:{run_id}", count=10):
-                                self.redis_client.delete(key)
+                            # Delete workspace-specific keys (scan for them)
+                            for pattern in [f"{{{self.redis_key_prefix}:*}}:metadata:{run_id}",
+                                          f"{{{self.redis_key_prefix}:*}}:stack:{run_id}"]:
+                                for key in self.redis_client.scan_iter(match=pattern, count=10):
+                                    if self.redis_client.delete(key):
+                                        if 'metadata' in key:
+                                            stats['redis_metadata'] += 1
+                                        else:
+                                            stats['redis_stack'] += 1
                     
                 finally:
                     cursor.close()
@@ -369,6 +377,8 @@ class RedisAwareInngestCleaner:
             logger.error(f"Error cleaning orphaned Redis state: {e}")
         
         return stats
+    
+    # ... rest of the methods remain the same ...
     
     def clean_function_data(self) -> Dict[str, int]:
         """Clean function-related data with Redis awareness."""
@@ -440,9 +450,6 @@ class RedisAwareInngestCleaner:
                 logger.error(f"Error cleaning function data: {e}")
                 cursor.close()
                 return stats
-        
-        # Continue with orphaned records cleanup...
-        # [Rest of the method remains the same as original]
         
         return stats
     
@@ -738,6 +745,7 @@ class RedisAwareInngestCleaner:
             self.connect()
             
             logger.info("Starting Redis-aware cleanup process...")
+            logger.info(f"Using Redis key patterns without :state suffix")
             
             # Track what needs more cleanup
             needs_more = {

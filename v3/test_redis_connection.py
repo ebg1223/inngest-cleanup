@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Test Redis connection for Inngest cleanup script.
+FIXED: Corrected key patterns based on actual Inngest deployment.
 """
 
 import os
@@ -24,11 +25,13 @@ def test_redis_connection():
         client.ping()
         print("✓ Redis connection successful")
         
-        # Check for Inngest keys
+        # Check for Inngest keys with CORRECT patterns (no :state suffix)
         patterns = [
-            f"{{{redis_key_prefix}:state}}:metadata:*",
-            f"{{{redis_key_prefix}:state}}:pauses:*",
-            f"{{{redis_key_prefix}:state}}:pr:*"
+            f"{{{redis_key_prefix}}}:pauses:*",  # Global pauses
+            f"{{{redis_key_prefix}}}:pr:*",      # Pause-run mappings
+            f"{{{redis_key_prefix}:*}}:metadata:*",  # Workspace-specific metadata
+            f"{{{redis_key_prefix}:*}}:stack:*",     # Workspace-specific stack
+            f"{{{redis_key_prefix}:*}}:pause-key:*", # Workspace-specific pause keys
         ]
         
         total_keys = 0
@@ -55,6 +58,12 @@ def test_redis_connection():
         print(f"  Version: {info.get('redis_version', 'unknown')}")
         print(f"  Used memory: {info.get('used_memory_human', 'unknown')}")
         print(f"  Connected clients: {info.get('connected_clients', 'unknown')}")
+        
+        # Check database info
+        db_info = client.info('keyspace')
+        print(f"\nDatabase info:")
+        for db_name, db_stats in db_info.items():
+            print(f"  {db_name}: {db_stats}")
         
         return True
         
