@@ -8,12 +8,12 @@ RUN apk add --no-cache dcron
 WORKDIR /app
 
 # Copy project files
-COPY pyproject.toml uv.lock* ./
+COPY pyproject.toml ./
 COPY *.py ./
 COPY cleanup_cron.sh docker-entrypoint.sh ./
 
 # Install dependencies
-RUN uv sync --frozen --no-dev
+RUN uv pip install --system psycopg2-binary>=2.9.0 redis>=6.2.0
 
 # Make scripts executable
 RUN chmod +x cleanup_cron.sh docker-entrypoint.sh
