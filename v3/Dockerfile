@@ -1,40 +1,22 @@
-# Use Python 3.12 slim image
-FROM python:3.12-slim
+# Use official uv image
+FROM ghcr.io/astral-sh/uv:python3.12-alpine
 
-# Install system dependencies (for psycopg2 and cron)
-RUN apt-get update && apt-get install -y \
-    gcc \
-    cron \
-    nano \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install uv
-RUN pip install uv
-
-# Create non-root user
-RUN useradd -m -s /bin/bash inngest
+# Install cron
+RUN apk add --no-cache dcron
 
 # Set working directory
 WORKDIR /app
 
 # Copy project files
-COPY pyproject.toml cleanup_inngest_env.py cleanup_inngest_env_with_redis.py ./
+COPY pyproject.toml uv.lock* ./
+COPY *.py ./
 COPY cleanup_cron.sh docker-entrypoint.sh ./
-COPY test_redis_connection.py scan_redis_keys.py ./
-COPY diagnostic_check.py verify_cleanup.py ./
-COPY debug_redis_pg_match.py ./
+
+# Install dependencies
+RUN uv sync --frozen --no-dev
 
 # Make scripts executable
-RUN chmod +x cleanup_cron.sh docker-entrypoint.sh test_redis_connection.py
-
-# Install dependencies directly
-RUN uv pip install --system psycopg2-binary>=2.9.0 redis>=6.2.0
-
-# Change ownership of app directory
-RUN chown -R inngest:inngest /app
-
-# Create log file with proper permissions
-RUN touch /var/log/cron.log && chown inngest:inngest /var/log/cron.log
+RUN chmod +x cleanup_cron.sh docker-entrypoint.sh
 
 # Environment variables with defaults
 ENV INNGEST_DATABASE_URL=""
