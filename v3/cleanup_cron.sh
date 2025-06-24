@@ -1,6 +1,9 @@
 #!/bin/bash
 # Cron script to run the Inngest cleanup
 
+# Set PATH for cron environment (Python docker images have python in /usr/local/bin)
+export PATH=/usr/local/bin:/usr/bin:/bin
+
 # Source environment variables from file (cron doesn't inherit them)
 if [ -f /etc/environment ]; then
     . /etc/environment
